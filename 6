@@ -1,7 +1,3 @@
-Oto pełny kod Python, który generuje raport z aktywności konsultantów, ukrywa kolumny od 2 do 8 oraz od 20 w górę, a także zachowuje wszystkie nowe funkcjonalności zgodnie z Twoimi wcześniejszymi wymaganiami.  
-**Kod jest gotowy do skopiowania i uruchomienia.**
-
-```python
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -44,7 +40,9 @@ def calculate_seconds(row):
     end = row['EndDateTime']
     intervals = []
 
-    while start  end:
+    while start < end:
+        next_hour = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        if next_hour > end:
             next_hour = end
         seconds = (next_hour - start).total_seconds()
         intervals.append((start.hour, seconds, row['UserId'], row['Wydzial']))
@@ -88,7 +86,7 @@ def max_simultaneous_consultants(df, hour):
     hour_start = base_date + pd.Timedelta(hours=hour)
     hour_end = hour_start + pd.Timedelta(hours=1)
 
-    df_hour = df[(df['StatusDateTime']  hour_start)]
+    df_hour = df[(df['StatusDateTime'] < hour_end) & (df['EndDateTime'] > hour_start)]
 
     timeline = []
     for _, row in df_hour.iterrows():
@@ -159,7 +157,7 @@ def time_over_3_per_department(df, hour, department):
     hour_start = base_date + pd.Timedelta(hours=hour)
     hour_end = hour_start + pd.Timedelta(hours=1)
 
-    df_hour_dept = df[(df['StatusDateTime']  hour_start) & (df['Wydzial'] == department)]
+    df_hour_dept = df[(df['StatusDateTime'] < hour_end) & (df['EndDateTime'] > hour_start) & (df['Wydzial'] == department)]
 
     timeline = []
     for _, row in df_hour_dept.iterrows():
@@ -223,12 +221,12 @@ for dept in departments:
 today_str = datetime.today().strftime("%Y-%m-%d %A")
 html_filename = "tabela_z_danymi.html"
 html_content = f"""
-
-
-
-  
-  Tabela z danymi
-  
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <title>Tabela z danymi</title>
+  <style>
       table {{
           border-collapse: collapse;
           table-layout: fixed;
@@ -254,48 +252,48 @@ html_content = f"""
       table tr > :nth-child(n+20) {{
           display: none;
       }}
-  
+  </style>
+</head>
+<body>
+  <p><strong>Data:</strong> {today_str}<br>
+  <strong>Limit w tym miesiącu:</strong> 1500 RBH<br>
+  <strong>Wykorzystano:</strong> 45 RBH<br>
+  <strong>Pozostało:</strong> 1455 RBH</p>
 
-
-  Data: {today_str}
-  Limit w tym miesiącu: 1500 RBH
-  Wykorzystano: 45 RBH
-  Pozostało: 1455 RBH
-
-  Tabela z danymi:
-  
-      Kliknij, aby rozwinąć tabelę
-      
-      
-          
-              
-                  Interwał
-                  Liczba unikalnych konsultantów
-                  Suma sekund statusu
-                  WZK1
-                  WZK2
-                  WZK3
-                  WZF
-                  WNT
-                  WZP
-                  Maks. konsultanci (ogółem; czas)
-                  Suma czasu, gdy 19 osób
-                  Suma czasu, gdy 20 osób
-                  Suma czasu, gdy 21 osób
-                  Suma czasu, gdy >18 osób
+  <p><strong>Tabela z danymi:</strong></p>
+  <details>
+      <summary><strong>Kliknij, aby rozwinąć tabelę</strong></summary>
+      <br>
+      <table>
+          <thead>
+              <tr>
+                  <th>Interwał</th>
+                  <th>Liczba unikalnych konsultantów</th>
+                  <th>Suma sekund statusu</th>
+                  <th>WZK1</th>
+                  <th>WZK2</th>
+                  <th>WZK3</th>
+                  <th>WZF</th>
+                  <th>WNT</th>
+                  <th>WZP</th>
+                  <th>Maks. konsultanci (ogółem; czas)</th>
+                  <th>Suma czasu, gdy 19 osób</th>
+                  <th>Suma czasu, gdy 20 osób</th>
+                  <th>Suma czasu, gdy 21 osób</th>
+                  <th>Suma czasu, gdy >18 osób</th>
 """
 for dept in departments:
-    html_content += f"Suma czasu, gdy >3 osoby ({dept})"
+    html_content += f"<th>Suma czasu, gdy >3 osoby ({dept})</th>"
 html_content += """
-                  WZK1 Maks. konsultanci (czas)
-                  WZK2 Maks. konsultanci (czas)
-                  WZK3 Maks. konsultanci (czas)
-                  WZF Maks. konsultanci (czas)
-                  WNT Maks. konsultanci (czas)
-                  WZP Maks. konsultanci (czas)
-              
-          
-          
+                  <th>WZK1 Maks. konsultanci (czas)</th>
+                  <th>WZK2 Maks. konsultanci (czas)</th>
+                  <th>WZK3 Maks. konsultanci (czas)</th>
+                  <th>WZF Maks. konsultanci (czas)</th>
+                  <th>WNT Maks. konsultanci (czas)</th>
+                  <th>WZP Maks. konsultanci (czas)</th>
+              </tr>
+          </thead>
+          <tbody>
 """
 
 def hhmmss_to_seconds(hhmmss):
@@ -311,21 +309,21 @@ for _, row in grouped.iterrows():
     over20_display = '' if row['Over20Seconds'] == 0 else seconds_to_hhmmss(row['Over20Seconds'])
     over21_display = '' if row['Over21Seconds'] == 0 else seconds_to_hhmmss(row['Over21Seconds'])
     over18_display = '' if row['Over18Seconds'] == 0 else seconds_to_hhmmss(row['Over18Seconds'])
-    html_content += f"{interval}{int(row['UniqueConsultants'])}{seconds_display}"
+    html_content += f"<tr><td>{interval}</td><td>{int(row['UniqueConsultants'])}</td><td>{seconds_display}</td>"
     for dept in departments:
         value = row[dept]
-        html_content += f"{'' if value == '00:00:00' else value}"
-    html_content += f"{row['MaxConsultantsSummary']}"
-    html_content += f"{over19_display}"
-    html_content += f"{over20_display}"
-    html_content += f"{over21_display}"
-    html_content += f"{over18_display}"
+        html_content += f"<td>{'' if value == '00:00:00' else value}</td>"
+    html_content += f"<td>{row['MaxConsultantsSummary']}</td>"
+    html_content += f"<td>{over19_display}</td>"
+    html_content += f"<td>{over20_display}</td>"
+    html_content += f"<td>{over21_display}</td>"
+    html_content += f"<td>{over18_display}</td>"
     for dept in departments:
         over3_display = '' if row[f'{dept}_Over3Seconds'] == 0 else seconds_to_hhmmss(row[f'{dept}_Over3Seconds'])
-        html_content += f"{over3_display}"
+        html_content += f"<td>{over3_display}</td>"
     for dept in departments:
-        html_content += f"{row[f'{dept}_MaxConsultantsInterval']}"
-    html_content += "\n"
+        html_content += f"<td>{row[f'{dept}_MaxConsultantsInterval']}</td>"
+    html_content += "</tr>\n"
 
 def sum_column(col):
     return seconds_to_hhmmss(sum(hhmmss_to_seconds(val) for val in grouped[col]))
@@ -347,35 +345,35 @@ for dept in departments:
     sum_row[f'{dept}_Over3Seconds'] = seconds_to_hhmmss(sum(grouped[f'{dept}_Over3Seconds']))
 
 html_content += f"""
-
-   Suma
-   
-   {'' if sum_row['Seconds'] == '00:00:00' else sum_row['Seconds']}
-   {'' if sum_row['WZK1'] == '00:00:00' else sum_row['WZK1']}
-   {'' if sum_row['WZK2'] == '00:00:00' else sum_row['WZK2']}
-   {'' if sum_row['WZK3'] == '00:00:00 else sum_row['WZK3']}
-   {'' if sum_row['WZF'] == '00:00:00' else sum_row['WZF']}
-   {'' if sum_row['WNT'] == '00:00:00' else sum_row['WNT']}
-   {'' if sum_row['WZP'] == '00:00:00' else sum_row['WZP']}
-   
-   {sum_row['Over19Seconds']}
-   {sum_row['Over20Seconds']}
-   {sum_row['Over21Seconds']}
-   {sum_row['Over18Seconds']}
+<tr>
+   <td><strong>Suma</strong></td>
+   <td></td>
+   <td>{'' if sum_row['Seconds'] == '00:00:00' else sum_row['Seconds']}</td>
+   <td>{'' if sum_row['WZK1'] == '00:00:00' else sum_row['WZK1']}</td>
+   <td>{'' if sum_row['WZK2'] == '00:00:00' else sum_row['WZK2']}</td>
+   <td>{'' if sum_row['WZK3'] == '00:00:00 else sum_row['WZK3']}</td>
+   <td>{'' if sum_row['WZF'] == '00:00:00' else sum_row['WZF']}</td>
+   <td>{'' if sum_row['WNT'] == '00:00:00' else sum_row['WNT']}</td>
+   <td>{'' if sum_row['WZP'] == '00:00:00' else sum_row['WZP']}</td>
+   <td></td>
+   <td>{sum_row['Over19Seconds']}</td>
+   <td>{sum_row['Over20Seconds']}</td>
+   <td>{sum_row['Over21Seconds']}</td>
+   <td>{sum_row['Over18Seconds']}</td>
 """
 for dept in departments:
-    html_content += f"{sum_row[f'{dept}_Over3Seconds']}"
+    html_content += f"<td>{sum_row[f'{dept}_Over3Seconds']}</td>"
 html_content += """
-   
-
+   <td colspan="6"></td>
+</tr>
 """
 
 html_content += """
-          
-      
-  
-
-
+          </tbody>
+      </table>
+  </details>
+</body>
+</html>
 """
 
 with open(html_filename, "w", encoding="utf-8") as file:
@@ -383,11 +381,11 @@ with open(html_filename, "w", encoding="utf-8") as file:
 
 # === Krok 7: Wyślij e-mail ===
 body = f"""
-Data: {today_str}
-Limit w tym miesiącu: 1500 RBH
-Wykorzystano: 45 RBH
-Pozostało: 1455 RBH
-Pełna tabela znajduje się w załączniku.
+<p><strong>Data:</strong> {today_str}<br>
+<strong>Limit w tym miesiącu:</strong> 1500 RBH<br>
+<strong>Wykorzystano:</strong> 45 RBH<br>
+<strong>Pozostało:</strong> 1455 RBH</p>
+<p>Pełna tabela znajduje się w załączniku.</p>
 """
 
 msg = MIMEMultipart()
@@ -409,19 +407,3 @@ try:
     print("✅ E-mail został wysłany z załącznikiem HTML.")
 except Exception as e:
     print(f"❌ Wystąpił błąd podczas wysyłania e-maila: {e}")
-```
-
-**Kod jest kompletny i gotowy do skopiowania oraz uruchomienia.**  
-Kolumnę od 2 do 8 oraz od 20 w górę ukrywa CSS w pliku HTML[1][3].  
-Wszystkie nowe funkcjonalności zostały uwzględnione.
-
-[1] https://ppl-ai-file-upload.s3.amazonaws.com/web/direct-files/attachments/49500387/b55b495d-81d0-46d7-8511-45ffb790abfd/paste.txt
-[2] https://dspace.uni.lodz.pl/bitstream/handle/11089/35209/pracadoktorska_RZ%CC%87.pdf?sequence=1&isAllowed=y
-[3] https://event.mostwiedzy.pl/event/30/attachments/238/432/ZN_WEiA_PG_65_eTEE2019.pdf
-[4] https://bg.pw.edu.pl/index.php/o-nas/2-artykul
-[5] https://jakosc.amu.edu.pl/wp-content/uploads/2024/03/matematyka-raport-samooceny.pdf
-[6] https://www.nik.gov.pl/plik/id,30688.pdf
-[7] https://www.kssip.gov.pl/sites/default/files/zalacznik_bez_tytulu_00080.pdf
-[8] https://www.oeiizk.waw.pl/wp-content/uploads/pliki/cyfrowa-szkola/Cyfrowa_Szkola_nr_9_na_WWW.pdf
-[9] https://pracujwit.pl/feed/all/
-[10] https://www.oeiizk.waw.pl/wp-content/uploads/pliki/cyfrowa-szkola/Cyfrowa_Szkola_nr_22_na_WWW.pdf
