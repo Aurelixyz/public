@@ -1,0 +1,252 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import configparser
+import os
+import pyodbc
+import pandas as pd
+from datetime import datetime, timedelta
+
+# === Krok 1: Wczytaj dane konfiguracyjne ===
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+sender_email = config.get('EMAIL', 'Sender')
+receiver_email = config.get('EMAIL', 'Receiver')
+smtp_server = config.get('EMAIL', 'SMTPServer')
+subject = config.get('EMAIL', 'Subject')
+conn_str = config.get('DATABASE', 'ConnectionString')
+
+# === Krok 2: Wczytaj zapytanie SQL z pliku ===
+with open("zapytanieREPLIKA.sql", "r", encoding="utf-8") as file:
+    query = file.read()
+
+# === Krok 3: Połącz się z bazą danych i wykonaj zapytanie ===
+conn = pyodbc.connect(conn_str)
+cursor = conn.cursor()
+cursor.execute(query)
+rows = cursor.fetchall()
+columns = [column[0] for column in cursor.description]
+df = pd.DataFrame.from_records(rows, columns=columns)
+
+df['StatusDateTime'] = pd.to_datetime(df['StatusDateTime'])
+df['EndDateTime'] = pd.to_datetime(df['EndDateTime'])
+
+# === Krok 4: Przetwórz dane ===
+def calculate_seconds(row):
+    start = row['StatusDateTime']
+    end = row['EndDateTime']
+    intervals = []
+
+    while start < end:
+        next_hour = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        if next_hour > end:
+            next_hour = end
+        seconds = (next_hour - start).total_seconds()
+        intervals.append((start.hour, seconds, row['UserId'], row['Wydzial']))
+        start = next_hour
+
+    return intervals
+
+intervals = []
+for _, row in df.iterrows():
+    intervals.extend(calculate_seconds(row))
+
+intervals_df = pd.DataFrame(intervals, columns=['Hour', 'Seconds', 'UserId', 'Wydzial'])
+
+grouped = intervals_df.groupby('Hour').agg({'Seconds': 'sum'}).reset_index()
+unique_users = intervals_df.groupby('Hour')['UserId'].nunique().reset_index()
+unique_users.columns = ['Hour', 'UniqueConsultants']
+grouped = pd.merge(grouped, unique_users, on='Hour', how='left').fillna(0)
+
+all_hours = pd.DataFrame({'Hour': range(24)})
+grouped = pd.merge(all_hours, grouped, on='Hour', how='left').fillna(0)
+
+# Formatowanie czasu
+def seconds_to_hhmmss(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02}:{minutes:02}:{secs:02}"
+
+grouped['Seconds'] = grouped['Seconds'].apply(seconds_to_hhmmss)
+
+# Dodaj kolumny dla wydziałów
+departments = ['WZK1', 'WZK2', 'WZK3', 'WZF', 'WNT', 'WZP']
+for dept in departments:
+    dept_seconds = intervals_df[intervals_df['Wydzial'] == dept].groupby('Hour')['Seconds'].sum().reset_index()
+    dept_seconds.columns = ['Hour', dept]
+    grouped = pd.merge(grouped, dept_seconds, on='Hour', how='left').fillna(0)
+
+for dept in departments:
+    grouped[dept] = grouped[dept].apply(seconds_to_hhmmss)
+
+# === Poprawiona logika liczenia przedziałów MaxConsultantsStart / End ===
+OVERLAP_THRESHOLD_SECONDS = 60  # co najmniej 60 sekund
+
+def max_simultaneous_consultants(df, hour):
+    hour_start = df['StatusDateTime'].dt.normalize() + pd.to_timedelta(hour, unit='h')
+    hour_end = hour_start + pd.Timedelta(hours=1)
+
+    df_hour = df[(df['StatusDateTime'] < hour_end[0]) & (df['EndDateTime'] > hour_start[0])]
+
+    timeline = []
+    for _, row in df_hour.iterrows():
+        start = max(row['StatusDateTime'], hour_start[0])
+        end = min(row['EndDateTime'], hour_end[0])
+        timeline.append((start, 1))
+        timeline.append((end, -1))
+
+    timeline.sort()
+
+    active = 0
+    max_active = 0
+    intervals = []
+    interval_start = None
+
+    for time, change in timeline:
+        prev_active = active
+        active += change
+
+        if active >= 2 and prev_active < 2:
+            interval_start = time
+        elif active < 2 and prev_active >= 2 and interval_start:
+            interval_end = time
+            duration = (interval_end - interval_start).total_seconds()
+            if duration >= OVERLAP_THRESHOLD_SECONDS:
+                intervals.append((interval_start, interval_end, prev_active))
+            interval_start = None
+
+        max_active = max(max_active, active)
+
+    if interval_start and (hour_end[0] - interval_start).total_seconds() >= OVERLAP_THRESHOLD_SECONDS:
+        intervals.append((interval_start, hour_end[0], active))
+
+    if intervals:
+        max_interval = max(intervals, key=lambda x: x[2])
+        return max_interval[2], max_interval[0], max_interval[1]
+    else:
+        return 0, pd.NaT, pd.NaT
+
+grouped['MaxConsultants'], grouped['MaxConsultantsStart'], grouped['MaxConsultantsEnd'] = zip(*grouped['Hour'].apply(lambda h: max_simultaneous_consultants(df, h)))
+
+# === Krok 6: Zapisz plik HTML ===
+today_str = datetime.today().strftime("%Y-%m-%d %A")
+html_filename = "tabela_z_danymi.html"
+html_content = f"""
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+   <meta charset="UTF-8">
+   <title>Tabela z danymi</title>
+   <style>
+       table {{
+           border-collapse: collapse;
+           table-layout: fixed;
+           font-family: Arial, sans-serif;
+           font-size: 14px;
+           width: auto;
+       }}
+       th, td {{
+           border: 1px solid #000;
+           text-align: center;
+           padding: 8px;
+           height: 10px;
+       }}
+       th:nth-child(1), td:nth-child(1) {{
+           width: 120px;
+       }}
+       th:nth-child(n+2):nth-child(-n+3),
+       td:nth-child(n+2):nth-child(-n+3) {{
+           width: 60px;
+       }}
+       th:nth-child(10), td:nth-child(10) {{
+           width: 100px;
+       }}
+       th:nth-child(11), td:nth-child(11),
+       th:nth-child(12), td:nth-child(12) {{
+           width: 140px;
+       }}
+   </style>
+</head>
+<body>
+   <p><strong>Data:</strong> {today_str}<br>
+   <strong>Limit w tym miesiącu:</strong> 1500 RBH<br>
+   <strong>Wykorzystano:</strong> 45 RBH<br>
+   <strong>Pozostało:</strong> 1455 RBH</p>
+
+   <p><strong>Tabela z danymi:</strong></p>
+
+   <details>
+       <summary><strong>Kliknij, aby rozwinąć tabelę</strong></summary>
+       <br>
+       <table>
+           <thead>
+               <tr>
+                   <th>Interwał</th>
+                   <th>Liczba unikalnych konsultantów</th>
+                   <th>Suma sekund statusu</th>
+                   <th>WZK1</th>
+                   <th>WZK2</th>
+                   <th>WZK3</th>
+                   <th>WZF</th>
+                   <th>WNT</th>
+                   <th>WZP</th>
+                   <th>Maksymalna liczba konsultantów jednocześnie przez ≥1 min</th>
+                   <th>MaxConsultantsStart</th>
+                   <th>MaxConsultantsEnd</th>
+               </tr>
+           </thead>
+           <tbody>
+"""
+
+for _, row in grouped.iterrows():
+    interval = f"{row['Hour']:02}:00 - {row['Hour'] + 1:02}:00"
+    start_str = row['MaxConsultantsStart'].strftime("%H:%M:%S") if pd.notnull(row['MaxConsultantsStart']) else ''
+    end_str = row['MaxConsultantsEnd'].strftime("%H:%M:%S") if pd.notnull(row['MaxConsultantsEnd']) else ''
+    html_content += f"<tr><td>{interval}</td><td>{int(row['UniqueConsultants'])}</td><td>{row['Seconds']}</td>"
+    for dept in departments:
+        html_content += f"<td>{row[dept]}</td>"
+    html_content += f"<td>{row['MaxConsultants']}</td><td>{start_str}</td><td>{end_str}</td></tr>\n"
+
+html_content += """
+           </tbody>
+       </table>
+   </details>
+</body>
+</html>
+"""
+
+with open(html_filename, "w", encoding="utf-8") as file:
+    file.write(html_content)
+
+# === Krok 7: Wyślij e-mail ===
+body = f"""
+<p><strong>Data:</strong> {today_str}<br>
+<strong>Limit w tym miesiącu:</strong> 1500 RBH<br>
+<strong>Wykorzystano:</strong> 45 RBH<br>
+<strong>Pozostało:</strong> 1455 RBH</p>
+<p>Pełna tabela znajduje się w załączniku.</p>
+"""
+
+msg = MIMEMultipart()
+msg['From'] = sender_email
+msg['To'] = receiver_email
+msg['Subject'] = subject
+msg.attach(MIMEText(body, 'html'))
+
+with open(html_filename, "rb") as attachment:
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(attachment.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(html_filename)}")
+    msg.attach(part)
+
+try:
+    with smtplib.SMTP(smtp_server) as server:
+        server.sendmail(sender_email, receiver_email, msg.as_string())
+    print("✅ E-mail został wysłany z załącznikiem HTML.")
+except Exception as e:
+    print(f"❌ Wystąpił błąd podczas wysyłania e-maila: {e}")
