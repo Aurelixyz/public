@@ -1,0 +1,404 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+import configparser
+import os
+import pyodbc
+import pandas as pd
+from datetime import datetime, timedelta
+
+# === Krok 1: Wczytaj dane konfiguracyjne ===
+config = configparser.ConfigParser()
+config.read('config.ini')
+
+sender_email = config.get('EMAIL', 'Sender')
+receiver_email = config.get('EMAIL', 'Receiver')
+smtp_server = config.get('EMAIL', 'SMTPServer')
+subject = config.get('EMAIL', 'Subject')
+conn_str = config.get('DATABASE', 'ConnectionString')
+
+# === Krok 2: Wczytaj zapytanie SQL z pliku ===
+with open("zapytanieREPLIKA.sql", "r", encoding="utf-8") as file:
+    query = file.read()
+
+# === Krok 3: Połącz się z bazą danych i wykonaj zapytanie ===
+conn = pyodbc.connect(conn_str)
+cursor = conn.cursor()
+cursor.execute(query)
+rows = cursor.fetchall()
+columns = [column[0] for column in cursor.description]
+df = pd.DataFrame.from_records(rows, columns=columns)
+
+df['StatusDateTime'] = pd.to_datetime(df['StatusDateTime'])
+df['EndDateTime'] = pd.to_datetime(df['EndDateTime'])
+
+# === Krok 4: Przetwórz dane ===
+def calculate_seconds(row):
+    start = row['StatusDateTime']
+    end = row['EndDateTime']
+    intervals = []
+
+    while start < end:
+        next_hour = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        if next_hour > end:
+            next_hour = end
+        seconds = (next_hour - start).total_seconds()
+        intervals.append((start.hour, seconds, row['UserId'], row['Wydzial']))
+        start = next_hour
+
+    return intervals
+
+intervals = []
+for _, row in df.iterrows():
+    intervals.extend(calculate_seconds(row))
+
+intervals_df = pd.DataFrame(intervals, columns=['Hour', 'Seconds', 'UserId', 'Wydzial'])
+
+grouped = intervals_df.groupby('Hour').agg({'Seconds': 'sum'}).reset_index()
+unique_users = intervals_df.groupby('Hour')['UserId'].nunique().reset_index()
+unique_users.columns = ['Hour', 'UniqueConsultants']
+grouped = pd.merge(grouped, unique_users, on='Hour', how='left').fillna(0)
+
+all_hours = pd.DataFrame({'Hour': range(24)})
+grouped = pd.merge(all_hours, grouped, on='Hour', how='left').fillna(0)
+
+def seconds_to_hhmmss(seconds):
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    return f"{hours:02}:{minutes:02}:{secs:02}"
+
+grouped['Seconds'] = grouped['Seconds'].apply(seconds_to_hhmmss)
+
+departments = ['WZK1', 'WZK2', 'WZK3', 'WZF', 'WNT', 'WZP']
+for dept in departments:
+    dept_seconds = intervals_df[intervals_df['Wydzial'] == dept].groupby('Hour')['Seconds'].sum().reset_index()
+    dept_seconds.columns = ['Hour', dept]
+    grouped = pd.merge(grouped, dept_seconds, on='Hour', how='left').fillna(0)
+    grouped[dept] = grouped[dept].apply(seconds_to_hhmmss)
+
+OVERLAP_THRESHOLD_SECONDS = 60
+
+def max_simultaneous_consultants(df, hour):
+    base_date = df['StatusDateTime'].dt.normalize().min()
+    hour_start = base_date + pd.Timedelta(hours=hour)
+    hour_end = hour_start + pd.Timedelta(hours=1)
+
+    df_hour = df[(df['StatusDateTime'] < hour_end) & (df['EndDateTime'] > hour_start)]
+
+    timeline = []
+    for _, row in df_hour.iterrows():
+        start = max(row['StatusDateTime'], hour_start)
+        end = min(row['EndDateTime'], hour_end)
+        timeline.append((start, 1))
+        timeline.append((end, -1))
+    timeline.sort()
+
+    active = 0
+    interval_start = None
+    interval_active = 0
+    valid_intervals = []
+    over19_time = 0.0
+    over20_time = 0.0
+    over21_time = 0.0
+    over18_time = 0.0
+
+    for i, (time, change) in enumerate(timeline):
+        prev_active = active
+        active += change
+
+        if prev_active != active:
+            if interval_start is not None:
+                duration = (time - interval_start).total_seconds()
+                if interval_active > 18:
+                    over18_time += duration
+                if interval_active >= 19:
+                    over19_time += duration
+                if interval_active >= 20:
+                    over20_time += duration
+                if interval_active >= 21:
+                    over21_time += duration
+                if duration >= 60 and interval_active >= 2:
+                    valid_intervals.append((interval_start, time, interval_active))
+            interval_start = time
+            interval_active = active
+
+    if interval_start is not None:
+        duration = (hour_end - interval_start).total_seconds()
+        if interval_active > 18:
+            over18_time += duration
+        if interval_active >= 19:
+            over19_time += duration
+        if interval_active >= 20:
+            over20_time += duration
+        if interval_active >= 21:
+            over21_time += duration
+        if duration >= 60 and interval_active >= 2:
+            valid_intervals.append((interval_start, hour_end, interval_active))
+
+    if valid_intervals:
+        max_interval = max(valid_intervals, key=lambda x: x[2])
+        return (
+            max_interval[2], max_interval[0], max_interval[1],
+            over19_time, over20_time, over21_time, over18_time
+        )
+    else:
+        return 0, pd.NaT, pd.NaT, 0.0, 0.0, 0.0, 0.0
+
+def max_simultaneous_consultants_by_department(df, hour, department):
+    df_dept = df[df['Wydzial'] == department]
+    result = max_simultaneous_consultants(df_dept, hour)
+    return result[:3]  # Zwraca tylko 3 wartości (bez over18_time itd. dla wydziałów)
+
+def time_over_3_per_department(df, hour, department):
+    base_date = df['StatusDateTime'].dt.normalize().min()
+    hour_start = base_date + pd.Timedelta(hours=hour)
+    hour_end = hour_start + pd.Timedelta(hours=1)
+
+    df_hour_dept = df[(df['StatusDateTime'] < hour_end) & (df['EndDateTime'] > hour_start) & (df['Wydzial'] == department)]
+
+    timeline = []
+    for _, row in df_hour_dept.iterrows():
+        start = max(row['StatusDateTime'], hour_start)
+        end = min(row['EndDateTime'], hour_end)
+        timeline.append((start, 1))
+        timeline.append((end, -1))
+    timeline.sort()
+
+    active = 0
+    interval_start = None
+    interval_active = 0
+    over3_time = 0.0
+
+    for i, (time, change) in enumerate(timeline):
+        prev_active = active
+        active += change
+
+        if prev_active != active:
+            if interval_start is not None:
+                duration = (time - interval_start).total_seconds()
+                if interval_active > 3:
+                    over3_time += duration
+            interval_start = time
+            interval_active = active
+
+    if interval_start is not None:
+        duration = (hour_end - interval_start).total_seconds()
+        if interval_active > 3:
+            over3_time += duration
+
+    return over3_time
+
+grouped['MaxConsultants'], grouped['MaxConsultantsStart'], grouped['MaxConsultantsEnd'], \
+grouped['Over19Seconds'], grouped['Over20Seconds'], grouped['Over21Seconds'], grouped['Over18Seconds'] = zip(
+    *grouped['Hour'].apply(lambda h: max_simultaneous_consultants(df, h))
+)
+
+for dept in departments:
+    grouped[f'{dept}_MaxConsultants'], grouped[f'{dept}_MaxConsultantsStart'], grouped[f'{dept}_MaxConsultantsEnd'] = zip(
+        *grouped['Hour'].apply(lambda h: max_simultaneous_consultants_by_department(df, h, dept))
+    )
+
+for dept in departments:
+    grouped[f'{dept}_Over3Seconds'] = grouped['Hour'].apply(
+        lambda h: time_over_3_per_department(df, h, dept)
+    )
+
+grouped['MaxConsultantsSummary'] = grouped.apply(
+    lambda row: f"{row['MaxConsultants']}; {row['MaxConsultantsStart'].strftime('%H:%M:%S')} - {row['MaxConsultantsEnd'].strftime('%H:%M:%S')}"
+    if pd.notnull(row['MaxConsultantsStart']) and pd.notnull(row['MaxConsultantsEnd']) else '', axis=1
+)
+
+for dept in departments:
+    grouped[f'{dept}_MaxConsultantsInterval'] = grouped.apply(
+        lambda row: f"{row[f'{dept}_MaxConsultants']}; {row[f'{dept}_MaxConsultantsStart'].strftime('%H:%M:%S')} - {row[f'{dept}_MaxConsultantsEnd'].strftime('%H:%M:%S')}"
+        if pd.notnull(row[f'{dept}_MaxConsultantsStart']) and pd.notnull(row[f'{dept}_MaxConsultantsEnd']) else '', axis=1
+    )
+
+# === Krok 6: Zapisz plik HTML ===
+today_str = datetime.today().strftime("%Y-%m-%d %A")
+html_filename = "tabela_z_danymi.html"
+html_content = f"""
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <title>Tabela z danymi</title>
+  <style>
+      table {{
+          border-collapse: collapse;
+          table-layout: fixed;
+          font-family: Arial, sans-serif;
+          font-size: 11px;
+          width: 100%;
+      }}
+      th, td {{
+          border: 1px solid #000;
+          text-align: center;
+          padding: 2px 4px;
+          word-break: break-word;
+          max-width: 60px;
+      }}
+      th:nth-child(1), td:nth-child(1) {{
+          max-width: 80px;
+      }}
+      tr:nth-child(even) {{
+          background-color: #f2f2f2;
+      }}
+  </style>
+</head>
+<body>
+  <p><strong>Data:</strong> {today_str}<br>
+  <strong>Limit w tym miesiącu:</strong> 1500 RBH<br>
+  <strong>Wykorzystano:</strong> 45 RBH<br>
+  <strong>Pozostało:</strong> 1455 RBH</p>
+
+  <p><strong>Tabela z danymi:</strong></p>
+  <details>
+      <summary><strong>Kliknij, aby rozwinąć tabelę</strong></summary>
+      <br>
+      <table>
+          <thead>
+              <tr>
+                  <th>Interwał</th>
+                  <th>Liczba unikalnych konsultantów</th>
+                  <th>Suma sekund statusu</th>
+                  <th>WZK1</th>
+                  <th>WZK2</th>
+                  <th>WZK3</th>
+                  <th>WZF</th>
+                  <th>WNT</th>
+                  <th>WZP</th>
+                  <th>Maks. konsultanci (ogółem; czas)</th>
+                  <th>Suma czasu, gdy 19 osób</th>
+                  <th>Suma czasu, gdy 20 osób</th>
+                  <th>Suma czasu, gdy 21 osób</th>
+                  <th>Suma czasu, gdy >18 osób</th>
+"""
+for dept in departments:
+    html_content += f"<th>Suma czasu, gdy >3 osoby ({dept})</th>"
+html_content += """
+                  <th>WZK1 Maks. konsultanci (czas)</th>
+                  <th>WZK2 Maks. konsultanci (czas)</th>
+                  <th>WZK3 Maks. konsultanci (czas)</th>
+                  <th>WZF Maks. konsultanci (czas)</th>
+                  <th>WNT Maks. konsultanci (czas)</th>
+                  <th>WZP Maks. konsultanci (czas)</th>
+              </tr>
+          </thead>
+          <tbody>
+"""
+
+def hhmmss_to_seconds(hhmmss):
+    if isinstance(hhmmss, str) and hhmmss:
+        h, m, s = map(int, hhmmss.split(':'))
+        return h * 3600 + m * 60 + s
+    return 0
+
+for _, row in grouped.iterrows():
+    interval = f"{row['Hour']:02}:00 - {row['Hour'] + 1:02}:00"
+    seconds_display = '' if row['Seconds'] == '00:00:00' else row['Seconds']
+    over19_display = '' if row['Over19Seconds'] == 0 else seconds_to_hhmmss(row['Over19Seconds'])
+    over20_display = '' if row['Over20Seconds'] == 0 else seconds_to_hhmmss(row['Over20Seconds'])
+    over21_display = '' if row['Over21Seconds'] == 0 else seconds_to_hhmmss(row['Over21Seconds'])
+    over18_display = '' if row['Over18Seconds'] == 0 else seconds_to_hhmmss(row['Over18Seconds'])
+    html_content += f"<tr><td>{interval}</td><td>{int(row['UniqueConsultants'])}</td><td>{seconds_display}</td>"
+    for dept in departments:
+        value = row[dept]
+        html_content += f"<td>{'' if value == '00:00:00' else value}</td>"
+    html_content += f"<td>{row['MaxConsultantsSummary']}</td>"
+    html_content += f"<td>{over19_display}</td>"
+    html_content += f"<td>{over20_display}</td>"
+    html_content += f"<td>{over21_display}</td>"
+    html_content += f"<td>{over18_display}</td>"
+    for dept in departments:
+        over3_display = '' if row[f'{dept}_Over3Seconds'] == 0 else seconds_to_hhmmss(row[f'{dept}_Over3Seconds'])
+        html_content += f"<td>{over3_display}</td>"
+    for dept in departments:
+        html_content += f"<td>{row[f'{dept}_MaxConsultantsInterval']}</td>"
+    html_content += "</tr>\n"
+
+def sum_column(col):
+    return seconds_to_hhmmss(sum(hhmmss_to_seconds(val) for val in grouped[col]))
+
+sum_row = {
+    'Seconds': sum_column('Seconds'),
+    'WZK1': sum_column('WZK1'),
+    'WZK2': sum_column('WZK2'),
+    'WZK3': sum_column('WZK3'),
+    'WZF': sum_column('WZF'),
+    'WNT': sum_column('WNT'),
+    'WZP': sum_column('WZP'),
+    'Over19Seconds': seconds_to_hhmmss(sum(grouped['Over19Seconds'])),
+    'Over20Seconds': seconds_to_hhmmss(sum(grouped['Over20Seconds'])),
+    'Over21Seconds': seconds_to_hhmmss(sum(grouped['Over21Seconds'])),
+    'Over18Seconds': seconds_to_hhmmss(sum(grouped['Over18Seconds']))
+}
+for dept in departments:
+    sum_row[f'{dept}_Over3Seconds'] = seconds_to_hhmmss(sum(grouped[f'{dept}_Over3Seconds']))
+
+html_content += f"""
+<tr>
+   <td><strong>Suma</strong></td>
+   <td></td>
+   <td>{'' if sum_row['Seconds'] == '00:00:00' else sum_row['Seconds']}</td>
+   <td>{'' if sum_row['WZK1'] == '00:00:00' else sum_row['WZK1']}</td>
+   <td>{'' if sum_row['WZK2'] == '00:00:00' else sum_row['WZK2']}</td>
+   <td>{'' if sum_row['WZK3'] == '00:00:00' else sum_row['WZK3']}</td>
+   <td>{'' if sum_row['WZF'] == '00:00:00' else sum_row['WZF']}</td>
+   <td>{'' if sum_row['WNT'] == '00:00:00' else sum_row['WNT']}</td>
+   <td>{'' if sum_row['WZP'] == '00:00:00' else sum_row['WZP']}</td>
+   <td></td>
+   <td>{sum_row['Over19Seconds']}</td>
+   <td>{sum_row['Over20Seconds']}</td>
+   <td>{sum_row['Over21Seconds']}</td>
+   <td>{sum_row['Over18Seconds']}</td>
+"""
+for dept in departments:
+    html_content += f"<td>{sum_row[f'{dept}_Over3Seconds']}</td>"
+html_content += """
+   <td colspan="6"></td>
+</tr>
+"""
+
+html_content += """
+          </tbody>
+      </table>
+  </details>
+</body>
+</html>
+"""
+
+with open(html_filename, "w", encoding="utf-8") as file:
+    file.write(html_content)
+
+# === Krok 7: Wyślij e-mail ===
+body = f"""
+<p><strong>Data:</strong> {today_str}<br>
+<strong>Limit w tym miesiącu:</strong> 1500 RBH<br>
+<strong>Wykorzystano:</strong> 45 RBH<br>
+<strong>Pozostało:</strong> 1455 RBH</p>
+<p>Pełna tabela znajduje się w załączniku.</p>
+"""
+
+msg = MIMEMultipart()
+msg['From'] = sender_email
+msg['To'] = receiver_email
+msg['Subject'] = subject
+msg.attach(MIMEText(body, 'html'))
+
+with open(html_filename, "rb") as attachment:
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(attachment.read())
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(html_filename)}")
+    msg.attach(part)
+
+try:
+    with smtplib.SMTP(smtp_server) as server:
+        server.sendmail(sender_email, receiver_email, msg.as_string())
+    print("✅ E-mail został wysłany z załącznikiem HTML.")
+except Exception as e:
+    print(f"❌ Wystąpił błąd podczas wysyłania e-maila: {e}")
