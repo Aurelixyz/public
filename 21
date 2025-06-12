@@ -1,0 +1,377 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.header import Header
+from email.mime.image import MIMEImage
+import configparser
+import pyodbc
+import pandas as pd
+from datetime import datetime, timedelta
+import codecs
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import numpy as np
+from matplotlib.colors import LinearSegmentedColormap, ListedColormap
+import io
+
+# === Krok 1: Wczytaj dane konfiguracyjne ===
+config = configparser.ConfigParser()
+try:
+    with codecs.open('config.ini', 'r', encoding='utf-8') as f:
+        config.read_file(f)
+except FileNotFoundError:
+    print("❌ Błąd: Plik config.ini nie został znaleziony. Upewnij się, że znajduje się w tym samym katalogu co skrypt.")
+    exit()
+except Exception as e:
+    print(f"❌ Błąd podczas wczytywania pliku config.ini: {e}")
+    exit()
+
+# Odczyt ustawień
+sender_email = config.get('EMAIL', 'Sender')
+receiver_email = config.get('EMAIL', 'Receiver')
+smtp_server = config.get('EMAIL', 'SMTPServer')
+subject = config.get('EMAIL', 'Subject')
+conn_str = config.get('DATABASE', 'ConnectionString')
+generate_plots = config.getboolean('REPORT_SETTINGS', 'GeneratePlots', fallback=True)
+
+try:
+    TOTAL_LIMIT = config.getint('REPORT_SETTINGS', 'TotalConsultantLimit')
+    DEPT_LIMIT = config.getint('REPORT_SETTINGS', 'DepartmentConsultantLimit')
+except (configparser.Error, ValueError):
+    print("⚠️ Ostrzeżenie: Nie można odczytać limitów z config.ini. Używam domyślnych wartości (18/3).")
+    TOTAL_LIMIT = 18
+    DEPT_LIMIT = 3
+
+# === Krok 2: Wczytaj zapytanie SQL z pliku ===
+query = ""
+try:
+    with open("zapytanieREPLIKA.sql", "r", encoding="utf-8") as file:
+        query = file.read()
+except FileNotFoundError:
+    print("❌ Błąd: Plik zapytanieREPLIKA.sql nie został znaleziony.")
+    exit()
+except Exception as e:
+    print(f"❌ Błąd podczas wczytywania pliku zapytanieREPLIKA.sql: {e}")
+    exit()
+
+# === Krok 3: Połącz się z bazą danych i wykonaj zapytanie ===
+df = pd.DataFrame()
+try:
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    columns = [column[0] for column in cursor.description]
+    df = pd.DataFrame.from_records(rows, columns=columns)
+    conn.close()
+    print("✅ Dane zostały pomyślnie pobrane z bazy danych.")
+except pyodbc.Error as ex:
+    sqlstate = ex.args[0]
+    print(f"❌ Błąd połączenia z bazą danych lub wykonania zapytania: {sqlstate}")
+    exit()
+except Exception as e:
+    print(f"❌ Wystąpił nieoczekiwany błąd podczas operacji na bazie danych: {e}")
+    exit()
+
+if df.empty:
+    print("⚠️ Ostrzeżenie: Brak danych do przetworzenia. Raport zostanie wygenerowany z pustymi danymi.")
+
+# === Krok 4: Przetwórz dane ===
+if not df.empty:
+    df['StatusDateTime'] = pd.to_datetime(df['StatusDateTime'])
+    df['EndDateTime'] = pd.to_datetime(df['EndDateTime'])
+else:
+    dummy_date = datetime.now()
+    df = pd.DataFrame(columns=['StatusDateTime', 'EndDateTime', 'UserId', 'Wydzial', 'PrzelozonyLoginWindows'])
+    df.loc[0] = [dummy_date, dummy_date + timedelta(minutes=1), 'DummyUser', 'WZK1', 'DummyPrzelozony']
+
+def calculate_seconds(row):
+    start = row['StatusDateTime']
+    end = row['EndDateTime']
+    intervals = []
+    while start < end:
+        next_hour = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        if next_hour > end:
+            next_hour = end
+        seconds = (next_hour - start).total_seconds()
+        intervals.append((start.hour, seconds, row['UserId'], row['Wydzial'], row['PrzelozonyLoginWindows']))
+        start = next_hour
+    return intervals
+
+intervals = []
+if not df.empty:
+    for _, row in df.iterrows():
+        intervals.extend(calculate_seconds(row))
+
+intervals_df = pd.DataFrame(intervals, columns=['Hour', 'Seconds', 'UserId', 'Wydzial', 'PrzelozonyLoginWindows'])
+grouped = intervals_df.groupby('Hour').agg({'Seconds': 'sum'}).reset_index()
+all_hours = pd.DataFrame({'Hour': range(24)})
+grouped = pd.merge(all_hours, grouped, on='Hour', how='left').fillna(0)
+
+def seconds_to_minutes(seconds):
+    return round(seconds / 60)
+
+def get_timeline(dataframe, hour):
+    base_date = dataframe['StatusDateTime'].dt.normalize().min() if not dataframe.empty else datetime.now().normalize()
+    hour_start = base_date + pd.Timedelta(hours=hour)
+    hour_end = hour_start + pd.Timedelta(hours=1)
+    df_hour = dataframe[(dataframe['StatusDateTime'] < hour_end) & (dataframe['EndDateTime'] > hour_start)]
+    if df_hour.empty: return []
+    timeline = []
+    for _, row in df_hour.iterrows():
+        timeline.append((max(row['StatusDateTime'], hour_start), 1))
+        timeline.append((min(row['EndDateTime'], hour_end), -1))
+    timeline.sort()
+    return timeline
+
+def max_simultaneous_consultants(df_current_hour, hour):
+    timeline = get_timeline(df_current_hour, hour)
+    active = 0
+    max_active = 0
+    over_total_limit_seconds = [0.0] * 6
+    if not timeline:
+        return 0, *over_total_limit_seconds
+
+    interval_start = timeline[0][0]
+    for time, change in timeline:
+        if time > interval_start:
+            duration = (time - interval_start).total_seconds()
+            for i in range(6):
+                if active >= (TOTAL_LIMIT + 1 + i):
+                    over_total_limit_seconds[i] += duration
+        if active > max_active:
+            max_active = active
+        active += change
+        interval_start = time
+    return max_active, *over_total_limit_seconds
+
+def time_over_dept_limit(department_df, hour, limit):
+    timeline = get_timeline(department_df, hour)
+    active = 0
+    over_limit_time = 0.0
+    if not timeline:
+        return 0.0
+    
+    interval_start = timeline[0][0]
+    for time, change in timeline:
+        if time > interval_start:
+            duration = (time - interval_start).total_seconds()
+            if active > limit:
+                over_limit_time += duration
+        active += change
+        interval_start = time
+    return over_limit_time
+
+# Obliczenia dla kolumn total
+total_cols = [f'Over{TOTAL_LIMIT + 1 + i}ConsultantsMinutes' for i in range(6)]
+results_total = grouped['Hour'].apply(lambda h: max_simultaneous_consultants(df, h))
+temp_df_total = pd.DataFrame(results_total.tolist(), columns=['MaxConsultants'] + total_cols, index=grouped.index)
+for col in temp_df_total.columns:
+    if col != 'MaxConsultants':
+        temp_df_total[col] = temp_df_total[col].apply(seconds_to_minutes)
+grouped = pd.concat([grouped, temp_df_total], axis=1)
+
+# Obliczenia dla kolumn departamentów
+departments = ['WZK1', 'WZK2', 'WZK3', 'WZF', 'WNT', 'WZP']
+dept_cols = []
+for dept in departments:
+    col_name = f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes'
+    dept_cols.append(col_name)
+    grouped[col_name] = grouped['Hour'].apply(lambda h: seconds_to_minutes(time_over_dept_limit(df[df['Wydzial'] == dept], h, DEPT_LIMIT)))
+
+# === Krok 5: Zapisanie danych do pliku CSV ===
+# (Opcjonalnie można zapisać, na razie pominięte)
+
+# === Krok 6: Generowanie wizualizacji ===
+image_buffers = []
+if generate_plots:
+    print("ℹ️ Generowanie wizualizacji...")
+    plt.style.use('default')
+    sns.set_palette("husl")
+
+    # WYKRES 1: Czas przeciążenia systemu
+    fig, ax = plt.subplots(figsize=(16, 10))
+    heatmap_data_total = grouped[total_cols].T
+    heatmap_data_total.columns = [f"{h:02d}:00" for h in grouped['Hour']]
+    heatmap_data_total.index = [f'≥{TOTAL_LIMIT + 1 + i} osób' for i in range(6)]
+    colors_red = ['#ffffff', '#ffe6e6', '#ffcccc', '#ff9999', '#ff6666', '#ff3333', '#cc0000']
+    cmap_red = LinearSegmentedColormap.from_list('custom_red', colors_red, N=100)
+    im = ax.imshow(heatmap_data_total.values, cmap=cmap_red, aspect='auto', interpolation='nearest')
+    ax.set_xlim(-0.5, 23.5); ax.set_ylim(-0.5, 5.5)
+    ax.set_xticks(range(0, 24, 2)); ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 2)], fontsize=11, rotation=45)
+    ax.set_yticks(range(6)); ax.set_yticklabels(heatmap_data_total.index, fontsize=12, fontweight='bold')
+    for i in range(len(heatmap_data_total.index)):
+        for j in range(len(heatmap_data_total.columns)):
+            value = heatmap_data_total.iloc[i, j]
+            if value > 0:
+                ax.text(j, i, f'{int(value)}', ha='center', va='center', fontsize=10, fontweight='bold', color='white' if value > heatmap_data_total.values.max() * 0.6 else 'black')
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8); cbar.set_label('Minuty przeciążenia', fontweight='bold')
+    plt.title('Czas przeciążenia systemu (minuty)', fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel('Godzina', fontsize=14, fontweight='bold'); ax.set_ylabel('Próg liczby konsultantów', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    img_buffer = io.BytesIO(); plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white'); img_buffer.seek(0); image_buffers.append(img_buffer); plt.close()
+
+    # WYKRES 2: Dashboard przeciążeń działów
+    fig, ax = plt.subplots(figsize=(18, 10))
+    heatmap_data_dept = grouped.set_index('Hour')[dept_cols].T
+    heatmap_data_dept.columns = [f"{h:02d}:00" for h in range(24)]
+    heatmap_data_dept.index = departments
+    colors_blue = ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#084594']
+    cmap_blue = LinearSegmentedColormap.from_list('custom_blue', colors_blue, N=100)
+    im = ax.imshow(heatmap_data_dept.values, cmap=cmap_blue, aspect='auto', interpolation='nearest')
+    ax.set_xlim(-0.5, 23.5); ax.set_ylim(-0.5, len(departments) - 0.5)
+    ax.set_xticks(range(0, 24, 2)); ax.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 2)], fontsize=11, rotation=45)
+    ax.set_yticks(range(len(departments))); ax.set_yticklabels(departments, fontsize=12, fontweight='bold')
+    for i in range(len(departments)):
+        for j in range(24):
+            value = heatmap_data_dept.iloc[i, j]
+            if value > 0:
+                ax.text(j, i, f'{int(value)}', ha='center', va='center', fontsize=10, fontweight='bold', color='white' if value > heatmap_data_dept.values.max() * 0.6 else 'black')
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8); cbar.set_label('Minuty przeciążenia', fontweight='bold')
+    plt.title(f'Dashboard przeciążeń działów (minuty z >{DEPT_LIMIT} konsultantami)', fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel('Godzina', fontsize=14, fontweight='bold'); ax.set_ylabel('Dział', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    img_buffer = io.BytesIO(); plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white'); img_buffer.seek(0); image_buffers.append(img_buffer); plt.close()
+    
+    # WYKRES 3 (pętla): Dashboardy przełożonych
+    def get_overload_intervals(department_df, hour, limit):
+        base_date = department_df['StatusDateTime'].dt.normalize().min() if not department_df.empty else datetime.now().normalize()
+        hour_start = base_date + pd.Timedelta(hours=hour)
+        hour_end = hour_start + pd.Timedelta(hours=1)
+        timeline = get_timeline(department_df, hour)
+        overload_periods = []
+        active = 0
+        if not timeline: return []
+        interval_start = timeline[0][0]
+        for time, change in timeline:
+            if time > interval_start:
+                if active > limit:
+                    overload_periods.append((interval_start, time))
+            active += change
+            interval_start = time
+        return overload_periods
+
+    for dept in departments:
+        df_dept = df[df['Wydzial'] == dept]
+        if df_dept.empty: continue
+        supervisors = sorted(df_dept['PrzelozonyLoginWindows'].unique())
+        if not supervisors: continue
+        
+        supervisor_heatmap_data = pd.DataFrame(0.0, index=supervisors, columns=range(24))
+        for hour in range(24):
+            overload_periods = get_overload_intervals(df_dept, hour, DEPT_LIMIT)
+            if not overload_periods: continue
+            
+            hour_start_ts = df['StatusDateTime'].min().normalize() + pd.Timedelta(hours=hour)
+            hour_end_ts = hour_start_ts + pd.Timedelta(hours=1)
+
+            for supervisor in supervisors:
+                total_contribution_seconds = 0
+                supervisor_sessions = df_dept[(df_dept['PrzelozonyLoginWindows'] == supervisor) & (df_dept['StatusDateTime'] < hour_end_ts) & (df_dept['EndDateTime'] > hour_start_ts)]
+                for o_start, o_end in overload_periods:
+                    for _, session in supervisor_sessions.iterrows():
+                        s_start = max(session['StatusDateTime'], o_start)
+                        s_end = min(session['EndDateTime'], o_end)
+                        if s_start < s_end:
+                            total_contribution_seconds += (s_end - s_start).total_seconds()
+                supervisor_heatmap_data.loc[supervisor, hour] = seconds_to_minutes(total_contribution_seconds)
+        
+        fig, ax = plt.subplots(figsize=(16, max(4, len(supervisors) * 0.6)))
+        
+        # ZMIANA: Niestandardowa mapa kolorów z białym tłem dla zera
+        viridis = plt.cm.get_cmap('viridis', 256)
+        newcolors = viridis(np.linspace(0, 1, 256))
+        newcolors[0, :] = np.array([1, 1, 1, 1]) # Ustaw kolor dla wartości 0 na biały
+        custom_cmap = ListedColormap(newcolors)
+        
+        im = ax.imshow(supervisor_heatmap_data.values, cmap=custom_cmap, aspect='auto', interpolation='nearest', vmin=0)
+        ax.set_xticks(range(24)); ax.set_xticklabels([f"{h:02d}:00" for h in range(24)], rotation=45)
+        ax.set_yticks(range(len(supervisors))); ax.set_yticklabels(supervisors, fontweight='bold')
+        for i in range(len(supervisors)):
+            for j in range(24):
+                value = supervisor_heatmap_data.iloc[i, j]
+                if value > 0:
+                    ax.text(j, i, f'{int(value)}', ha='center', va='center', fontsize=9, fontweight='bold', color='white' if value > supervisor_heatmap_data.values.max() * 0.5 else 'black')
+        cbar = plt.colorbar(im, ax=ax, shrink=0.8); cbar.set_label('Minuty wkładu w przeciążenie', fontweight='bold')
+        ax.set_title(f'Wkład w przeciążenie w dziale {dept} wg przełożonego', fontsize=16, fontweight='bold', pad=20)
+        plt.tight_layout()
+        img_buffer = io.BytesIO(); plt.savefig(img_buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white'); img_buffer.seek(0); image_buffers.append(img_buffer); plt.close()
+
+# === Krok 7: Budowanie finalnej treści HTML e-maila ===
+try:
+    limit_rbh = config.getfloat('REPORT_SETTINGS', 'MonthlyLimitRBH')
+except (configparser.Error, ValueError):
+    limit_rbh = 1500.0
+total_seconds_today = intervals_df['Seconds'].sum()
+used_rbh = total_seconds_today / 3600.0
+remaining_rbh = limit_rbh - used_rbh
+limit_rbh_formatted, used_rbh_formatted, remaining_rbh_formatted = f"{limit_rbh:.2f}", f"{used_rbh:.2f}", f"{remaining_rbh:.2f}"
+report_date = df['StatusDateTime'].min().normalize() if not df.empty else datetime.now().normalize()
+polish_day = ['Poniedziałek', 'Wtorek', 'Środa', 'Czwartek', 'Piątek', 'Sobota', 'Niedziela'][report_date.weekday()]
+today_str = report_date.strftime(f"%Y-%m-%d {polish_day}")
+
+header_titles = [("Interwał", 60)]
+for i in range(6): header_titles.append((f"min. przy ≥{TOTAL_LIMIT + 1 + i} os.", 40))
+for dept in departments: header_titles.append((f"min. przy >{DEPT_LIMIT} {dept}", 40))
+
+final_html_content = f"""...""" # Początek HTML
+
+total_violation_occurred = grouped[f'Over{TOTAL_LIMIT + 1}ConsultantsMinutes'].sum() > 0
+dept_violation_occurred = sum(grouped[f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes'].sum() for dept in departments) > 0
+alert_message, alert_color = ("ALERT: Wykryto przekroczenia limitów!", "#c82333") if total_violation_occurred or dept_violation_occurred else ("OK: Nie wykryto przekroczeń limitów.", "#28a745")
+
+final_html_content = f"""
+<!DOCTYPE html><html><head><meta name="color-scheme" content="light dark"><meta name="supported-color-schemes" content="light dark"></head>
+<body style="background-color:#ffffff; font-family: Arial, sans-serif;">
+<p style="font-size:12px;"><strong>Data:</strong> {today_str}<br><strong>Limit w tym miesiącu:</strong> {limit_rbh_formatted} RBH<br>
+<strong>Wykorzystano:</strong> {used_rbh_formatted} RBH<br><strong>Pozostało:</strong> {remaining_rbh_formatted} RBH</p>
+<p style="font-size:14px; font-weight:bold; color:white; background-color:{alert_color}; padding: 10px; border-radius: 5px; text-align:center;">{alert_message}</p>
+<table border="1" cellpadding="3" cellspacing="0" width="900" style="border-collapse:collapse; background-color:#ffffff; font-size:9px;">
+<tr>{''.join(f'<th style="width:{w}px; background-color:#e0e0e0; text-align:center;">{t}</th>' for t, w in header_titles)}</tr>
+"""
+for idx, row in grouped.iterrows():
+    row_bg_color = "#f2f2f2" if idx % 2 == 0 else "#ffffff"
+    final_html_content += f'<tr><td style="background-color:{row_bg_color}; text-align:center;">{row["Hour"]:02}:00</td>'
+    for col in total_cols + dept_cols:
+        val = row[col]
+        display = f'<b>{val}</b>' if val > 0 else ''
+        cell_bg_color = '#ffcccc' if val > 0 else row_bg_color
+        final_html_content += f'<td style="background-color:{cell_bg_color}; text-align:center;">{display}</td>'
+    final_html_content += "</tr>"
+final_html_content += '<tr><td style="background-color:#e0e0e0; text-align:center;"><strong>Suma</strong></td>'
+for col in total_cols + dept_cols:
+    total_sum = grouped[col].sum()
+    display_sum = f'<b>{total_sum}</b>' if total_sum > 0 else ''
+    sum_bg_color = '#ffcccc' if total_sum > 0 else '#e0e0e0'
+    final_html_content += f'<td style="background-color:{sum_bg_color}; text-align:center;">{display_sum}</td>'
+final_html_content += "</tr></table>"
+
+if generate_plots and image_buffers:
+    final_html_content += '<div style="height:20px;"></div>'
+    for i, _ in enumerate(image_buffers):
+        final_html_content += f'<img src="cid:image{i}" style="width:900px; max-width:100%; display:block; margin-top:20px;">'
+final_html_content += "</body></html>"
+
+
+# === Krok 8: Wyślij e-mail ===
+msg = MIMEMultipart('related')
+msg['From'] = sender_email
+msg['To'] = receiver_email
+msg['Subject'] = Header(subject, 'utf-8')
+html_part = MIMEText(final_html_content, 'html', 'utf-8')
+msg.attach(html_part)
+
+if generate_plots:
+    for i, img_buffer in enumerate(image_buffers):
+        img = MIMEImage(img_buffer.read())
+        img.add_header('Content-ID', f'<image{i}>')
+        img.add_header('Content-Disposition', 'inline', filename=f'wykres_{i+1}.png')
+        msg.attach(img)
+        img_buffer.close()
+try:
+    with smtplib.SMTP(smtp_server) as server:
+        server.sendmail(sender_email, receiver_email, msg.as_string())
+    print("✅ E-mail został wysłany z tabelą HTML.")
+except Exception as e:
+    print(f"❌ Wystąpił błąd podczas wysyłania e-maila: {e}")
