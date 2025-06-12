@@ -1,0 +1,430 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.header import Header
+from email.mime.image import MIMEImage
+import configparser
+import pyodbc
+import pandas as pd
+from datetime import datetime, timedelta
+import codecs
+import matplotlib.pyplot as plt
+import seaborn as sns
+import os
+import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
+import io
+
+# === Krok 1: Wczytaj dane konfiguracyjne ===
+config = configparser.ConfigParser()
+try:
+    with codecs.open('config.ini', 'r', encoding='utf-8') as f:
+        config.read_file(f)
+except FileNotFoundError:
+    print("❌ Błąd: Plik config.ini nie został znaleziony. Upewnij się, że znajduje się w tym samym katalogu co skrypt.")
+    exit()
+except Exception as e:
+    print(f"❌ Błąd podczas wczytywania pliku config.ini: {e}")
+    exit()
+
+sender_email = config.get('EMAIL', 'Sender')
+receiver_email = config.get('EMAIL', 'Receiver')
+smtp_server = config.get('EMAIL', 'SMTPServer')
+subject = config.get('EMAIL', 'Subject')
+conn_str = config.get('DATABASE', 'ConnectionString')
+generate_plots = config.getboolean('REPORT_SETTINGS', 'GeneratePlots', fallback=True)
+
+# === Krok 2: Wczytaj zapytanie SQL z pliku ===
+query = ""
+try:
+    with open("zapytanieREPLIKA.sql", "r", encoding="utf-8") as file:
+        query = file.read()
+except FileNotFoundError:
+    print("❌ Błąd: Plik zapytanieREPLIKA.sql nie został znaleziony.")
+    exit()
+except Exception as e:
+    print(f"❌ Błąd podczas wczytywania pliku zapytanieREPLIKA.sql: {e}")
+    exit()
+
+# === Krok 3: Połącz się z bazą danych i wykonaj zapytanie ===
+df = pd.DataFrame()
+try:
+    conn = pyodbc.connect(conn_str)
+    cursor = conn.cursor()
+    cursor.execute(query)
+    rows = cursor.fetchall()
+    columns = [column[0] for column in cursor.description]
+    df = pd.DataFrame.from_records(rows, columns=columns)
+    conn.close()
+    print("✅ Dane zostały pomyślnie pobrane z bazy danych.")
+except pyodbc.Error as ex:
+    sqlstate = ex.args[0]
+    print(f"❌ Błąd połączenia z bazą danych lub wykonania zapytania: {sqlstate}")
+    exit()
+except Exception as e:
+    print(f"❌ Wystąpił nieoczekiwany błąd podczas operacji na bazie danych: {e}")
+    exit()
+
+if df.empty:
+    print("⚠️ Ostrzeżenie: Brak danych do przetworzenia. Raport zostanie wygenerowany z pustymi danymi.")
+
+if not df.empty:
+    df['StatusDateTime'] = pd.to_datetime(df['StatusDateTime'])
+    df['EndDateTime'] = pd.to_datetime(df['EndDateTime'])
+else:
+    dummy_date = datetime.now()
+    df = pd.DataFrame(columns=['StatusDateTime', 'EndDateTime', 'UserId', 'Wydzial'])
+    df.loc[0] = [dummy_date, dummy_date + timedelta(minutes=1), 'DummyUser', 'WZK1']
+
+# === Krok 4: Przetwórz dane ===
+def calculate_seconds(row):
+    start = row['StatusDateTime']
+    end = row['EndDateTime']
+    intervals = []
+    while start < end:
+        next_hour = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        if next_hour > end:
+            next_hour = end
+        seconds = (next_hour - start).total_seconds()
+        intervals.append((start.hour, seconds, row['UserId'], row['Wydzial']))
+        start = next_hour
+    return intervals
+
+intervals = []
+if not df.empty:
+    for _, row in df.iterrows():
+        intervals.extend(calculate_seconds(row))
+
+intervals_df = pd.DataFrame(intervals, columns=['Hour', 'Seconds', 'UserId', 'Wydzial'])
+grouped = intervals_df.groupby('Hour').agg({'Seconds': 'sum'}).reset_index()
+unique_users = intervals_df.groupby('Hour')['UserId'].nunique().reset_index()
+unique_users.columns = ['Hour', 'UniqueConsultants']
+grouped = pd.merge(grouped, unique_users, on='Hour', how='left').fillna(0)
+all_hours = pd.DataFrame({'Hour': range(24)})
+grouped = pd.merge(all_hours, grouped, on='Hour', how='left').fillna(0)
+
+def seconds_to_minutes(seconds):
+    return round(seconds / 60)
+
+grouped['Seconds'] = grouped['Seconds'].apply(seconds_to_minutes)
+departments = ['WZK1', 'WZK2', 'WZK3', 'WZF', 'WNT', 'WZP']
+for dept in departments:
+    dept_seconds = intervals_df[intervals_df['Wydzial'] == dept].groupby('Hour')['Seconds'].sum().reset_index()
+    dept_seconds.columns = ['Hour', dept]
+    grouped = pd.merge(grouped, dept_seconds, on='Hour', how='left').fillna(0)
+    grouped[dept] = grouped[dept].apply(seconds_to_minutes)
+
+def max_simultaneous_consultants(df_current_hour, hour):
+    base_date = df_current_hour['StatusDateTime'].dt.normalize().min() if not df_current_hour.empty else datetime.now().normalize()
+    hour_start = base_date + pd.Timedelta(hours=hour)
+    hour_end = hour_start + pd.Timedelta(hours=1)
+    df_hour = df_current_hour[(df_current_hour['StatusDateTime'] < hour_end) & (df_current_hour['EndDateTime'] > hour_start)]
+    timeline = []
+    for _, row in df_hour.iterrows():
+        start = max(row['StatusDateTime'], hour_start)
+        end = min(row['EndDateTime'], hour_end)
+        timeline.append((start, 1))
+        timeline.append((end, -1))
+    timeline.sort()
+    active = 0; interval_start = None; interval_active = 0; valid_intervals = []
+    at_least_19_minutes, at_least_20_minutes, at_least_21_minutes, at_least_22_minutes, at_least_23_minutes, at_least_24_minutes = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+    for i, (time, change) in enumerate(timeline):
+        prev_active = active
+        active += change
+        if prev_active != active:
+            if interval_start is not None:
+                duration = (time - interval_start).total_seconds()
+                if interval_active >= 19: at_least_19_minutes += duration
+                if interval_active >= 20: at_least_20_minutes += duration
+                if interval_active >= 21: at_least_21_minutes += duration
+                if interval_active >= 22: at_least_22_minutes += duration
+                if interval_active >= 23: at_least_23_minutes += duration
+                if interval_active >= 24: at_least_24_minutes += duration
+                if duration >= 60 and interval_active >= 2: valid_intervals.append((interval_start, time, interval_active))
+            interval_start = time
+            interval_active = active
+    if interval_start is not None:
+        duration = (hour_end - interval_start).total_seconds()
+        if interval_active >= 19: at_least_19_minutes += duration
+        if interval_active >= 20: at_least_20_minutes += duration
+        if interval_active >= 21: at_least_21_minutes += duration
+        if interval_active >= 22: at_least_22_minutes += duration
+        if interval_active >= 23: at_least_23_minutes += duration
+        if interval_active >= 24: at_least_24_minutes += duration
+        if duration >= 60 and interval_active >= 2: valid_intervals.append((interval_start, hour_end, interval_active))
+    if valid_intervals:
+        max_interval = max(valid_intervals, key=lambda x: x[2])
+        return (max_interval[2], max_interval[0], max_interval[1], at_least_19_minutes, at_least_20_minutes, at_least_21_minutes, at_least_22_minutes, at_least_23_minutes, at_least_24_minutes)
+    else:
+        return 0, pd.NaT, pd.NaT, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+def max_simultaneous_consultants_by_department(df_current_hour, hour, department):
+    df_dept = df_current_hour[df_current_hour['Wydzial'] == department]
+    return max_simultaneous_consultants(df_dept, hour)[:3]
+
+def time_over_3_per_department(df_current_hour, hour, department):
+    base_date = df_current_hour['StatusDateTime'].dt.normalize().min() if not df_current_hour.empty else datetime.now().normalize()
+    hour_start = base_date + pd.Timedelta(hours=hour)
+    hour_end = hour_start + pd.Timedelta(hours=1)
+    df_hour_dept = df_current_hour[(df_current_hour['StatusDateTime'] < hour_end) & (df_current_hour['EndDateTime'] > hour_start) & (df_current_hour['Wydzial'] == department)]
+    timeline = []
+    for _, row in df_hour_dept.iterrows():
+        start = max(row['StatusDateTime'], hour_start)
+        end = min(row['EndDateTime'], hour_end)
+        timeline.append((start, 1))
+        timeline.append((end, -1))
+    timeline.sort()
+    active = 0; interval_start = None; interval_active = 0; over3_time = 0.0
+    for i, (time, change) in enumerate(timeline):
+        prev_active = active
+        active += change
+        if prev_active != active:
+            if interval_start is not None:
+                duration = (time - interval_start).total_seconds()
+                if interval_active > 3: over3_time += duration
+            interval_start = time
+            interval_active = active
+    if interval_start is not None:
+        duration = (hour_end - interval_start).total_seconds()
+        if interval_active > 3: over3_time += duration
+    return over3_time
+
+grouped['MaxConsultants'], grouped['MaxConsultantsStart'], grouped['MaxConsultantsEnd'], grouped['AtLeast19ConsultantsMinutes'], grouped['AtLeast20ConsultantsMinutes'], grouped['AtLeast21ConsultantsMinutes'], grouped['AtLeast22ConsultantsMinutes'], grouped['AtLeast23ConsultantsMinutes'], grouped['AtLeast24ConsultantsMinutes'] = zip(*grouped['Hour'].apply(lambda h: max_simultaneous_consultants(df, h)))
+for dept in departments:
+    grouped[f'{dept}_MaxConsultants'], grouped[f'{dept}_MaxConsultantsStart'], grouped[f'{dept}_MaxConsultantsEnd'] = zip(*grouped['Hour'].apply(lambda h: max_simultaneous_consultants_by_department(df, h, dept)))
+    grouped[f'{dept}_AtLeast3ConsultantsMinutes'] = grouped['Hour'].apply(lambda h: time_over_3_per_department(df, h, dept))
+
+for col in ['AtLeast19ConsultantsMinutes', 'AtLeast20ConsultantsMinutes', 'AtLeast21ConsultantsMinutes', 'AtLeast22ConsultantsMinutes', 'AtLeast23ConsultantsMinutes', 'AtLeast24ConsultantsMinutes'] + [f'{dept}_AtLeast3ConsultantsMinutes' for dept in departments]:
+    grouped[col] = grouped[col].apply(seconds_to_minutes)
+
+# === Krok 5: Zapisanie danych do pliku CSV ===
+report_date_str_for_filename = df['StatusDateTime'].min().normalize().strftime("%Y-%m-%d") if not df.empty else datetime.now().strftime("%Y-%m-%d")
+csv_filename = f"raport_dzienny_{report_date_str_for_filename}.csv"
+grouped.to_csv(csv_filename, index=False, encoding='utf-8')
+print(f"✅ Dane raportu zostały zapisane do pliku: {csv_filename}")
+
+
+# === Krok 6: Generowanie wizualizacji i zapisanie ich do PAMIĘCI ===
+image_buffers = []
+
+if generate_plots:
+    print("ℹ️ Generowanie wizualizacji...")
+    plt.style.use('default')
+    sns.set_palette("husl")
+
+    # WYKRES 2
+    fig, ax = plt.subplots(figsize=(16, 10))
+    over_cols = ['AtLeast19ConsultantsMinutes', 'AtLeast20ConsultantsMinutes', 'AtLeast21ConsultantsMinutes', 'AtLeast22ConsultantsMinutes', 'AtLeast23ConsultantsMinutes', 'AtLeast24ConsultantsMinutes']
+    heatmap_data = grouped[over_cols].T
+    heatmap_data.columns = [f"{h:02d}:00" for h in grouped['Hour']]
+    heatmap_data.index = ['≥19 osób', '≥20 osób', '≥21 osób', '≥22 osób', '≥23 osób', '≥24 osób']
+    colors = ['#ffffff', '#ffe6e6', '#ffcccc', '#ff9999', '#ff6666', '#ff3333', '#cc0000']
+    cmap = LinearSegmentedColormap.from_list('custom_red', colors, N=100)
+    im = ax.imshow(heatmap_data.values, cmap=cmap, aspect='auto', interpolation='nearest')
+    ax.set_xlim(-0.5, len(heatmap_data.columns) - 0.5); ax.set_ylim(-0.5, len(heatmap_data.index) - 0.5)
+    ax.set_xticks(range(0, len(heatmap_data.columns), 2)); ax.set_xticklabels([heatmap_data.columns[i] for i in range(0, len(heatmap_data.columns), 2)], fontsize=11, rotation=45)
+    ax.set_yticks(range(len(heatmap_data.index))); ax.set_yticklabels(heatmap_data.index, fontsize=12, fontweight='bold')
+    for i in range(len(heatmap_data.index)):
+        for j in range(len(heatmap_data.columns)):
+            value = heatmap_data.iloc[i, j]
+            if value > 0:
+                text_color = 'white' if value > heatmap_data.values.max() * 0.6 else 'black'
+                ax.text(j, i, f'{int(value)}', ha='center', va='center', fontsize=10, fontweight='bold', color=text_color)
+    cbar = plt.colorbar(im, ax=ax, shrink=0.8, aspect=30); cbar.set_label('Minuty przeciążenia', fontsize=12, fontweight='bold'); cbar.ax.tick_params(labelsize=11)
+    plt.title('Czas przeciążenia systemu (minuty z co najmniej N konsultantami)', fontsize=16, fontweight='bold', pad=20)
+    ax.set_xlabel('Godzina', fontsize=14, fontweight='bold'); ax.set_ylabel('Próg liczby konsultantów', fontsize=14, fontweight='bold')
+    ax.set_xticks(np.arange(-0.5, len(heatmap_data.columns), 1), minor=True); ax.set_yticks(np.arange(-0.5, len(heatmap_data.index), 1), minor=True)
+    ax.grid(which='minor', color='gray', linestyle='-', linewidth=0.5, alpha=0.3)
+    plt.tight_layout()
+    
+    img_buffer_2 = io.BytesIO()
+    plt.savefig(img_buffer_2, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+    img_buffer_2.seek(0)
+    image_buffers.append(img_buffer_2)
+    plt.close()
+
+    # WYKRES 3
+    fig = plt.figure(figsize=(18, 12))
+    ax_main = plt.subplot2grid((4, 4), (0, 0), colspan=3, rowspan=3)
+    df_heatmap = grouped.set_index('Hour')[[f'{dept}_AtLeast3ConsultantsMinutes' for dept in departments]].T
+    df_heatmap.columns = [f"{h:02d}:00" for h in grouped['Hour']]; df_heatmap.index = departments
+    colors_blue = ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#084594']
+    cmap_blue = LinearSegmentedColormap.from_list('custom_blue', colors_blue, N=100)
+    im = ax_main.imshow(df_heatmap.values, cmap=cmap_blue, aspect='auto', interpolation='nearest')
+    ax_main.set_xlim(-0.5, len(df_heatmap.columns) - 0.5); ax_main.set_ylim(-0.5, len(df_heatmap.index) - 0.5)
+    ax_main.set_xticks(range(0, len(df_heatmap.columns), 2)); ax_main.set_xticklabels([df_heatmap.columns[i] for i in range(0, len(df_heatmap.columns), 2)], fontsize=11, rotation=45)
+    ax_main.set_yticks(range(len(df_heatmap.index))); ax_main.set_yticklabels(df_heatmap.index, fontsize=12, fontweight='bold')
+    for i in range(len(df_heatmap.index)):
+        for j in range(len(df_heatmap.columns)):
+            value = df_heatmap.iloc[i, j]
+            if value > 0:
+                text_color = 'white' if value > df_heatmap.values.max() * 0.6 else 'black'
+                ax_main.text(j, i, f'{int(value)}', ha='center', va='center', fontsize=9, fontweight='bold', color=text_color)
+    ax_main.set_title('Dashboard przeciążeń działów (minuty z co najmniej 3 konsultantami)\nMinuty z >3 konsultantami na dział (godzina)', fontsize=14, fontweight='bold', pad=15)
+    ax_main.set_xlabel('Godzina', fontsize=12, fontweight='bold'); ax_main.set_ylabel('Dział', fontsize=12, fontweight='bold')
+    ax_right = plt.subplot2grid((4, 4), (0, 3), rowspan=3)
+    dept_sums = [grouped[f'{dept}_AtLeast3ConsultantsMinutes'].sum() for dept in departments]
+    colors_dept = plt.cm.Set3(np.linspace(0, 1, len(departments)))
+    bars_right = ax_right.barh(range(len(departments)), dept_sums, color=colors_dept, alpha=0.8)
+    ax_right.set_yticks(range(len(departments))); ax_right.set_yticklabels(departments, fontsize=10)
+    ax_right.set_xlabel('Suma minut', fontsize=11, fontweight='bold'); ax_right.set_title('Suma\nna dział', fontsize=12, fontweight='bold')
+    max_dept_sum = max(dept_sums) if dept_sums else 1
+    for i, (bar, value) in enumerate(zip(bars_right, dept_sums)):
+        if value > 0:
+            current_color_rgb = [x * 255 for x in bar.get_facecolor()[:3]]
+            text_color_right = 'black' if sum(current_color_rgb) / 3 > 180 else 'white'
+            if value / max_dept_sum < 0.15: text_x_pos = bar.get_width() + (max_dept_sum * 0.01); ha_align = 'left'; text_color_right = 'black'
+            else: text_x_pos = bar.get_x() + bar.get_width() * 0.25; ha_align = 'left'
+            ax_right.text(text_x_pos, bar.get_y() + bar.get_height() / 2, f'{int(value)}', ha=ha_align, va='center', fontsize=10, fontweight='bold', color=text_color_right)
+    ax_bottom = plt.subplot2grid((4, 4), (3, 0), colspan=3)
+    hour_sums = [grouped[[f'{dept}_AtLeast3ConsultantsMinutes' for dept in departments]].iloc[h].sum() for h in range(24)]
+    bars_bottom = ax_bottom.bar(range(24), hour_sums, color='steelblue', alpha=0.7)
+    ax_bottom.set_xlim(-0.5, 23.5); ax_bottom.set_xticks(range(0, 24, 2)); ax_bottom.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 2)], fontsize=10)
+    ax_bottom.set_xlabel('Godzina', fontsize=11, fontweight='bold'); ax_bottom.set_ylabel('Suma minut', fontsize=11, fontweight='bold'); ax_bottom.set_title('Suma na godzinę', fontsize=12, fontweight='bold')
+    max_hour_sum = max(hour_sums) if hour_sums else 1
+    for i, (bar, value) in enumerate(zip(bars_bottom, hour_sums)):
+        if value > 0:
+            text_color_bottom = 'white' if value / max_hour_sum > 0.3 else 'black'
+            if value / max_hour_sum < 0.1: text_y_pos = bar.get_height() + 5; va_align = 'bottom'; text_color_bottom = 'black'
+            else: text_y_pos = bar.get_height() * 0.7; va_align = 'center'
+            ax_bottom.text(bar.get_x() + bar.get_width() / 2, text_y_pos, f'{int(value)}', ha='center', va=va_align, fontsize=9, fontweight='bold', color=text_color_bottom)
+    cbar = plt.colorbar(im, ax=ax_main, shrink=0.8, aspect=20); cbar.set_label('Minuty', fontsize=11, fontweight='bold')
+    plt.subplots_adjust(left=0.05, right=0.95, top=0.88, bottom=0.15, wspace=0.3, hspace=0.4)
+    
+    img_buffer_3 = io.BytesIO()
+    plt.savefig(img_buffer_3, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+    img_buffer_3.seek(0)
+    image_buffers.append(img_buffer_3)
+    plt.close()
+    
+    print(f"✅ Wizualizacje zostały wygenerowane w pamięci.")
+else:
+    print("ℹ️ Generowanie wizualizacji pominięte zgodnie z konfiguracją.")
+
+# === Krok 7: Budowanie finalnej treści HTML e-maila ===
+
+# <-- ZMIANA: Dynamiczne obliczanie roboczogodzin (RBH) -->
+try:
+    # Odczytaj limit z pliku config.ini. Upewnij się, że ta opcja istnieje w pliku.
+    limit_rbh = config.getfloat('REPORT_SETTINGS', 'MonthlyLimitRBH')
+except (configparser.NoSectionError, configparser.NoOptionError):
+    print("⚠️ Ostrzeżenie: Brak ustawienia 'MonthlyLimitRBH' w config.ini. Używam domyślnej wartości 1500.")
+    limit_rbh = 1500.0
+
+# Oblicz wykorzystane roboczogodziny z sumy sekund w intervals_df (surowe dane przed zaokrągleniem do minut)
+total_seconds_today = intervals_df['Seconds'].sum()
+used_rbh = total_seconds_today / 3600.0
+
+# Oblicz pozostałe roboczogodziny
+remaining_rbh = limit_rbh - used_rbh
+
+# Formatowanie wartości do dwóch miejsc po przecinku
+limit_rbh_formatted = f"{limit_rbh:.2f}"
+used_rbh_formatted = f"{used_rbh:.2f}"
+remaining_rbh_formatted = f"{remaining_rbh:.2f}"
+# <-- Koniec bloku obliczeniowego RBH -->
+
+report_date = df['StatusDateTime'].min().normalize() if not df.empty else datetime.now().normalize()
+day_names_polish = {'Monday': 'Poniedziałek', 'Tuesday': 'Wtorek', 'Wednesday': 'Środa', 'Thursday': 'Czwartek', 'Friday': 'Piątek', 'Saturday': 'Sobota', 'Sunday': 'Niedziela'}
+english_day = report_date.strftime("%A")
+polish_day = day_names_polish.get(english_day, english_day)
+today_str = report_date.strftime(f"%Y-%m-%d {polish_day}")
+
+header_titles = [("Interwał", 60), ("min. przy 19+ os.", 40), ("min. przy 20+ os.", 40), ("min. przy 21+ os.", 40), ("min. przy 22+ os.", 40), ("min. przy 23+ os.", 40), ("min. przy 24+ os.", 40)]
+for dept in departments:
+    header_titles.append((f"min. przy 3+ {dept}", 40))
+
+final_html_content = f"""\
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+</head>
+<body style="background-color:#ffffff;">
+<p style="font-family: Arial, sans-serif; font-size:12px; color:#000000; background-color:#ffffff;">
+<strong>Data:</strong> {today_str}<br>
+<strong>Limit w tym miesiącu:</strong> {limit_rbh_formatted} RBH<br>
+<strong>Wykorzystano:</strong> {used_rbh_formatted} RBH<br>
+<strong>Pozostało:</strong> {remaining_rbh_formatted} RBH</p>
+<table border="1" cellpadding="3" cellspacing="0" width="900" style="border-collapse:collapse; background-color:#ffffff;">
+  <tr>
+"""
+
+for title, width in header_titles:
+    final_html_content += f'<th style="font-family: Arial, sans-serif; font-size:9px; width:{width}px; background-color:#e0e0e0; color:#000000; text-align:center;">{title}</th>'
+final_html_content += "</tr>"
+
+for idx, row in grouped.iterrows():
+    row_bg_color = "#f2f2f2" if idx % 2 == 0 else "#ffffff"
+    final_html_content += "<tr>"
+    final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:60px; background-color:{row_bg_color}; color:#000000; text-align:center;">{row["Hour"]:02}:00</td>'
+    for col in ['AtLeast19ConsultantsMinutes', 'AtLeast20ConsultantsMinutes', 'AtLeast21ConsultantsMinutes', 'AtLeast22ConsultantsMinutes', 'AtLeast23ConsultantsMinutes', 'AtLeast24ConsultantsMinutes']:
+        val = row[col]
+        display = '' if val == 0 else val
+        final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:{row_bg_color}; color:#000000; text-align:center;">{display}</td>'
+    for dept in departments:
+        col = f'{dept}_AtLeast3ConsultantsMinutes'
+        val = row[col]
+        display = '' if val == 0 else val
+        final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:{row_bg_color}; color:#000000; text-align:center;">{display}</td>'
+    final_html_content += "</tr>"
+
+final_html_content += '<tr><td style="font-family: Arial, sans-serif; font-size:9px; width:60px; background-color:#e0e0e0; color:#000000; text-align:center;"><strong>Suma</strong></td>'
+for col in ['AtLeast19ConsultantsMinutes', 'AtLeast20ConsultantsMinutes', 'AtLeast21ConsultantsMinutes', 'AtLeast22ConsultantsMinutes', 'AtLeast23ConsultantsMinutes', 'AtLeast24ConsultantsMinutes']:
+    final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:#e0e0e0; color:#000000; text-align:center;"><strong>{grouped[col].sum()}</strong></td>'
+for dept in departments:
+    col = f'{dept}_AtLeast3ConsultantsMinutes'
+    final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:#e0e0e0; color:#000000; text-align:center;"><strong>{grouped[col].sum()}</strong></td>'
+final_html_content += "</tr></table>"
+
+
+if generate_plots and image_buffers:
+    final_html_content += """
+<table border="0" cellpadding="0" cellspacing="0" width="100%" style="font-size:1px;line-height:1px;">
+  <tr><td height="20" style="font-size: 20px; line-height: 20px;">&nbsp;</td></tr>
+</table>
+"""
+
+    for i, _ in enumerate(image_buffers):
+        final_html_content += f"""
+<table border="0" cellpadding="0" cellspacing="0" width="900" align="left">
+  <tr>
+    <td>
+      <img src="cid:image{i}" width="900" style="width: 900px; max-width: 100%; height: auto; display: block;">
+    </td>
+  </tr>
+</table>
+"""
+        final_html_content += """
+<table border="0" cellpadding="0" cellspacing="0" width="100%" style="font-size:1px;line-height:1px;">
+  <tr><td height="20" style="font-size: 20px; line-height: 20px;">&nbsp;</td></tr>
+</table>
+"""
+
+
+final_html_content += "</body></html>"
+
+# === Krok 8: Wyślij e-mail z osadzonymi wizualizacjami ===
+msg = MIMEMultipart('related')
+msg['From'] = sender_email
+msg['To'] = receiver_email
+msg['Subject'] = Header(subject, 'utf-8')
+
+html_part = MIMEText(final_html_content, 'html', 'utf-8')
+msg.attach(html_part)
+
+if generate_plots:
+    for i, img_buffer in enumerate(image_buffers):
+        img = MIMEImage(img_buffer.read())
+        img.add_header('Content-ID', f'<image{i}>')
+        img.add_header('Content-Disposition', 'inline', filename=f'wykres_{i+1}.png')
+        msg.attach(img)
+        img_buffer.close()
+
+try:
+    with smtplib.SMTP(smtp_server) as server:
+        server.sendmail(sender_email, receiver_email, msg.as_string())
+    print("✅ E-mail został wysłany z tabelą HTML.")
+except Exception as e:
+    print(f"❌ Wystąpił błąd podczas wysyłania e-maila: {e}")
