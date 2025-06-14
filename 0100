@@ -258,7 +258,8 @@ def stworz_dashboard(heatmap_data, fig_title, main_title, y_axis_label, right_ba
     """
     Tworzy i zapisuje do bufora spójny wizualnie dashboard.
     """
-    fig_height = max(8, len(heatmap_data.index) * 0.9)
+    # Zwiększona wysokość dla lepszych proporcji
+    fig_height = max(10, len(heatmap_data.index) * 1.0)
     fig = plt.figure(figsize=(18, fig_height))
 
     # Główna mapa ciepła
@@ -282,17 +283,23 @@ def stworz_dashboard(heatmap_data, fig_title, main_title, y_axis_label, right_ba
     # Boczny wykres słupkowy
     ax_right = plt.subplot2grid((5, 5), (0, 4), rowspan=3, colspan=1)
     sumy_per_row = heatmap_data.sum(axis=1)
-    # Zgodnie ze wzorcem, ten wykres ma różne kolory dla każdego słupka
     bar_colors = plt.cm.Set3(np.linspace(0, 1, len(sumy_per_row)))
-    ax_right.barh(sumy_per_row.index, sumy_per_row.values, color=bar_colors, alpha=0.8)
+    bars = ax_right.barh(sumy_per_row.index, sumy_per_row.values, color=bar_colors, alpha=0.8)
     ax_right.set_title(right_bar_title, fontsize=12)
     ax_right.get_yaxis().set_visible(False)
     ax_right.invert_yaxis()
+    
+    # Dodawanie etykiet do słupków bocznych
+    for bar in bars:
+        width = bar.get_width()
+        if width > 0:
+            x_pos = width * 0.98
+            y_pos = bar.get_y() + bar.get_height() / 2
+            ax_right.text(x_pos, y_pos, f'{int(width)}', va='center', ha='right', color='white', fontsize=9, fontweight='bold')
 
     # Dolny wykres słupkowy
     ax_bottom = plt.subplot2grid((5, 5), (3, 0), rowspan=2, colspan=4)
     sumy_per_col = heatmap_data.sum(axis=0)
-    # Zgodnie ze wzorcem, ten wykres ma jeden, stały kolor
     ax_bottom.bar(sumy_per_col.index, sumy_per_col.values, color='steelblue', alpha=0.7)
     ax_bottom.set_title(bottom_bar_title, fontsize=12)
     ax_bottom.set_xticks(np.arange(0, 24, 2))
@@ -353,6 +360,7 @@ if generate_plots:
     print(" -> Generowanie dashboardu naruszeń wydziałowych...")
     dept_heatmap_cols = [f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes' for dept in departments]
     df_heatmap_wydzialy = grouped.set_index('Hour')[dept_heatmap_cols].T
+    # POPRAWKA: Użycie reindex() aby zapewnić 24 kolumny
     df_heatmap_wydzialy = df_heatmap_wydzialy.reindex(columns=range(24)).fillna(0)
     df_heatmap_wydzialy.index = departments
     
@@ -393,7 +401,7 @@ if generate_plots:
 
         img_buffer_koordynator = stworz_dashboard(
             heatmap_data=heatmap_data_koordynatorzy,
-            fig_title=f"Dashboard Aktywności Koordynatorów - Wydział {dept}",
+            fig_title=f"Dashboard aktywności statusy koordynatorskie - wydział {dept}",
             main_title='Minuty na statusie koordynatorskim per godzinę',
             y_axis_label='Koordynator',
             right_bar_title='Suma minut\nna koordynatora',
@@ -479,8 +487,8 @@ if generate_plots and image_buffers:
     for i, _ in enumerate(image_buffers):
         # Tabela-dystanser dla pewnego odstępu w Outlooku
         final_html_content += '<table border="0" cellpadding="0" cellspacing="0" width="100%"><tr><td height="25" style="font-size: 25px; line-height: 25px;">&nbsp;</td></tr></table>'
-        # Tabela-kontener dla obrazka, aby wymusić układ blokowy
-        final_html_content += f'<table border="0" cellpadding="0" cellspacing="0" width="800" align="center"><tr><td><img src="cid:image{i}" width="800" style="width: 800px; height: auto; display: block;"></td></tr></table>'
+        # Tabela-kontener dla obrazka, aby wymusić układ blokowy i wyrównanie do lewej
+        final_html_content += f'<table border="0" cellpadding="0" cellspacing="0" width="800" align="left"><tr><td><img src="cid:image{i}" width="800" style="width: 800px; height: auto; display: block;"></td></tr></table>'
 
 final_html_content += "</body></html>"
 print("✅ Treść e-maila gotowa.")
