@@ -390,4 +390,122 @@ if generate_plots:
         image_buffers.append(img_buffer)
         plt.close(fig)
 
-    print("✅ Wszystkie wizualiza
+    print("✅ Wszystkie wizualizacje wygenerowane.")
+else:
+    print("\n Krok 6: Generowanie wizualizacji pominięte (zgodnie z konfiguracją).")
+
+# === Krok 7: Budowanie finalnej treści HTML e-maila ===
+print("\n Krok 7: Budowanie treści e-maila...")
+
+total_seconds_today = intervals_df['Seconds'].sum()
+used_rbh = total_seconds_today / 3600.0
+remaining_rbh = limit_rbh - used_rbh
+limit_rbh_formatted = f"{limit_rbh:.2f}"
+used_rbh_formatted = f"{used_rbh:.2f}"
+remaining_rbh_formatted = f"{remaining_rbh:.2f}"
+
+report_date = df['StatusDateTime'].min().normalize() if not df.empty else datetime.now().normalize()
+day_names_polish = {'Monday': 'Poniedziałek', 'Tuesday': 'Wtorek', 'Wednesday': 'Środa', 'Thursday': 'Czwartek', 'Friday': 'Piątek', 'Saturday': 'Sobota', 'Sunday': 'Niedziela'}
+english_day = report_date.strftime("%A")
+polish_day = day_names_polish.get(english_day, english_day)
+today_str = report_date.strftime(f"%Y-%m-%d {polish_day}")
+
+header_titles = [("Interwał", 60)]
+for i in range(6):
+    header_titles.append((f"min. przy ≥{TOTAL_LIMIT + 1 + i} os.", 40))
+for dept in departments:
+    header_titles.append((f"min. przy >{DEPT_LIMIT} {dept}", 40))
+
+final_html_content = f"""\
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
+</head>
+<body style="background-color:#ffffff; font-family: Arial, sans-serif;">
+<p style="font-size:12px; color:#000000;">
+<strong>Data:</strong> {today_str}<br>
+<strong>Limit w tym miesiącu:</strong> {limit_rbh_formatted} RBH<br>
+<strong>Wykorzystano:</strong> {used_rbh_formatted} RBH<br>
+<strong>Pozostało:</strong> {remaining_rbh_formatted} RBH</p>
+"""
+
+total_violation_occurred = grouped[f'Over{TOTAL_LIMIT + 1}ConsultantsMinutes'].sum() > 0 if f'Over{TOTAL_LIMIT + 1}ConsultantsMinutes' in grouped.columns else False
+dept_violation_occurred = sum(grouped[f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes'].sum() for dept in departments if f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes' in grouped.columns) > 0
+
+if total_violation_occurred or dept_violation_occurred:
+    alert_message = "ALERT: Wykryto przekroczenia limitów!"
+    alert_color = "#c82333"
+else:
+    alert_message = "OK: Nie wykryto przekroczeń limitów."
+    alert_color = "#28a745"
+
+final_html_content += f"""
+<p style="font-size:14px; font-weight:bold; color:white; background-color:{alert_color}; padding: 10px; border-radius: 5px; text-align:center;">
+{alert_message}
+</p>
+<p style="font-size:14px; font-weight:bold; color:#000000;">Tabela naruszeń limitów:</p>
+<table border="1" cellpadding="3" cellspacing="0" width="900" style="border-collapse:collapse; background-color:#ffffff;"><tr>
+"""
+for title, width in header_titles:
+    final_html_content += f'<th style="font-family: Arial, sans-serif; font-size:9px; width:{width}px; background-color:#e0e0e0; color:#000000; text-align:center;">{title}</th>'
+final_html_content += "</tr>"
+
+for idx, row in grouped.iterrows():
+    row_bg_color = "#f2f2f2" if idx % 2 == 0 else "#ffffff"
+    final_html_content += "<tr>"
+    final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:60px; background-color:{row_bg_color}; color:#000000; text-align:center;">{row["Hour"]:02}:00</td>'
+    for col in total_cols:
+        val = row.get(col, 0)
+        display = '' if val == 0 else f'<b>{int(val)}</b>'
+        cell_bg_color = '#ffcccc' if val > 0 else row_bg_color
+        final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:{cell_bg_color}; color:#000000; text-align:center;">{display}</td>'
+    for dept in departments:
+        col = f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes'
+        val = row.get(col, 0)
+        display = '' if val == 0 else f'<b>{int(val)}</b>'
+        cell_bg_color = '#ffcccc' if val > 0 else row_bg_color
+        final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:{cell_bg_color}; color:#000000; text-align:center;">{display}</td>'
+    final_html_content += "</tr>"
+
+final_html_content += '<tr><td style="font-family: Arial, sans-serif; font-size:9px; width:60px; background-color:#e0e0e0; color:#000000; text-align:center;"><strong>Suma</strong></td>'
+for col in total_cols + [f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes' for dept in departments]:
+    total_sum = grouped[col].sum() if col in grouped.columns else 0
+    display_sum = '' if total_sum == 0 else f'<b>{int(total_sum)}</b>'
+    sum_bg_color = '#ffcccc' if total_sum > 0 else '#e0e0e0'
+    final_html_content += f'<td style="font-family: Arial, sans-serif; font-size:9px; width:40px; background-color:{sum_bg_color}; color:#000000; text-align:center;">{display_sum}</td>'
+final_html_content += "</tr></table>"
+
+if generate_plots and image_buffers:
+    final_html_content += '<p style="font-size:14px; font-weight:bold; color:#000000; margin-top: 20px;">Wizualizacje:</p>'
+    for i, _ in enumerate(image_buffers):
+        final_html_content += f'<img src="cid:image{i}" width="900" style="width: 900px; max-width: 100%; height: auto; display: block; border: 1px solid #ccc; margin-top: 20px;">'
+
+final_html_content += "</body></html>"
+print("✅ Treść e-maila gotowa.")
+
+# === Krok 8: Wysyłka e-maila ===
+print("\n Krok 8: Wysyłanie e-maila...")
+msg = MIMEMultipart('related')
+msg['From'] = sender_email
+msg['To'] = receiver_email
+msg['Subject'] = Header(subject, 'utf-8')
+html_part = MIMEText(final_html_content, 'html', 'utf-8')
+msg.attach(html_part)
+
+if generate_plots and image_buffers:
+    for i, img_buffer in enumerate(image_buffers):
+        img = MIMEImage(img_buffer.read())
+        img.add_header('Content-ID', f'<image{i}>')
+        img_buffer.close()
+        msg.attach(img)
+
+try:
+    with smtplib.SMTP(smtp_server) as server:
+        server.sendmail(sender_email, receiver_email.split(','), msg.as_string())
+    print("✅ E-mail został pomyślnie wysłany!")
+except Exception as e:
+    print(f"❌ Wystąpił błąd podczas wysyłania e-maila: {e}")
+
+print("\n--- Zakończono pracę skryptu ---")
