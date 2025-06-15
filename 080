@@ -1,0 +1,332 @@
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.header import Header
+from email.mime.image import MIMEImage
+import configparser
+import pyodbc
+import pandas as pd
+from datetime import datetime, timedelta
+import codecs
+import matplotlib.pyplot as plt
+import seaborn as sns
+import io
+import numpy as np
+from matplotlib.colors import LinearSegmentedColormap
+import base64
+import logging
+
+# === Konfiguracja Logowania ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("raport_menedzerski.log", encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+
+# === Krok 1: Wczytaj dane konfiguracyjne ===
+logging.info("Krok 1: Wczytywanie konfiguracji...")
+config = configparser.ConfigParser()
+try:
+    with codecs.open('config.ini', 'r', encoding='utf-8') as f:
+        config.read_file(f)
+except FileNotFoundError:
+    logging.error("Plik config.ini nie został znaleziony.")
+    exit()
+except Exception:
+    logging.exception("Wystąpił krytyczny błąd podczas wczytywania pliku config.ini.")
+    exit()
+
+# Odczyt ustawień
+sender_email = config.get('EMAIL', 'Sender')
+so_email = config.get('EMAIL', 'SO_Mailbox') # Nowy adres UDW
+smtp_server = config.get('EMAIL', 'SMTPServer')
+subject_template = config.get('EMAIL', 'Subject')
+conn_str = config.get('DATABASE', 'ConnectionString')
+print("✅ Konfiguracja wczytana pomyślnie.")
+
+# === Krok 2: Wczytaj zapytania SQL z plików ===
+logging.info("Krok 2: Wczytywanie zapytań SQL...")
+try:
+    with open("zapytanieREPLIKA.sql", "r", encoding="utf-8") as file:
+        query_aktywnosci = file.read()
+    with open("zapytanieListaKoordynatorow.sql", "r", encoding="utf-8") as file:
+        query_przelozonych = file.read()
+    logging.info("Zapytania SQL wczytane.")
+except FileNotFoundError as e:
+    logging.error(f"Plik SQL nie został znaleziony: {e.filename}")
+    exit()
+except Exception:
+    logging.exception("Wystąpił błąd podczas wczytywania plików SQL.")
+    exit()
+
+# === Krok 3: Połącz się z bazą danych i pobierz dane ===
+logging.info("Krok 3: Pobieranie danych z bazy...")
+try:
+    conn = pyodbc.connect(conn_str)
+    df_aktywnosci = pd.read_sql(query_aktywnosci, conn)
+    df_przelozonych = pd.read_sql(query_przelozonych, conn)
+    conn.close()
+    logging.info(f"Pobrano {len(df_aktywnosci)} rekordów aktywności.")
+    logging.info(f"Pobrano {len(df_przelozonych)} wszystkich przełożonych.")
+except Exception:
+    logging.exception("Wystąpił nieoczekiwany błąd podczas operacji na bazie danych.")
+    exit()
+
+# === Krok 4: Przetwarzanie i czyszczenie danych ===
+logging.info("Krok 4: Przetwarzanie i czyszczenie danych...")
+
+# Rozdzielenie przełożonych na menedżerów i koordynatorów
+df_menedzerowie = df_przelozonych[df_przelozonych['StanowiskoTaryfikatoroweNazwa'] == 'Menedżer Wydziału'].copy()
+df_koordynatorzy = df_przelozonych[df_przelozonych['StanowiskoTaryfikatoroweNazwa'] == 'Koordynator'].copy()
+df_koordynatorzy.rename(columns={'LoginWindows': 'PrzelozonyLoginWindows'}, inplace=True)
+
+# Stworzenie mapy: Wydział -> email Menedżera
+manager_email_map = df_menedzerowie.set_index('Wydzial')['mail'].to_dict()
+
+# Filtrowanie ról, aby analizować tylko konsultantów
+if 'RolaNazwa' in df_aktywnosci.columns:
+    role_konsultantow = ['Agent', 'Pre-Ekspert', 'Ekspert']
+    df_aktywnosci = df_aktywnosci[df_aktywnosci['RolaNazwa'].isin(role_konsultantow)]
+
+if df_aktywnosci.empty:
+    logging.warning("Brak danych o aktywnościach do przetworzenia. Zakończono pracę.")
+    exit()
+
+df = df_aktywnosci.copy()
+df['StatusDateTime'] = pd.to_datetime(df['StatusDateTime'])
+df['EndDateTime'] = pd.to_datetime(df['EndDateTime'])
+
+# Funkcja dzieląca sesje na godzinowe interwały
+def calculate_seconds(row):
+    start = row['StatusDateTime']
+    end = row['EndDateTime']
+    intervals = []
+    while start < end:
+        next_hour = (start + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+        if next_hour > end:
+            next_hour = end
+        seconds = (next_hour - start).total_seconds()
+        intervals.append((start.hour, seconds, row['UserId'], row['Wydzial'], row['PrzelozonyLoginWindows']))
+        start = next_hour
+    return intervals
+
+# Przetwarzanie interwałów
+logging.info(" -> Obliczanie interwałów godzinowych...")
+intervals = []
+for _, row in df.iterrows():
+    intervals.extend(calculate_seconds(row))
+intervals_df = pd.DataFrame(intervals, columns=['Hour', 'Seconds', 'UserId', 'Wydzial', 'PrzelozonyLoginWindows'])
+
+# --- NOWA FUNKCJA OBLICZENIOWA DLA MENEDŻERÓW ---
+def calculate_time_over_dept_thresholds(df_dept_intervals, hour, thresholds):
+    hour_intervals = df_dept_intervals[df_dept_intervals['Hour'] == hour]
+    if hour_intervals.empty:
+        return {f'over_{t}': 0 for t in thresholds}
+
+    # Symulacja na osi czasu tylko dla danej godziny
+    base_date = df['StatusDateTime'].min().normalize()
+    hour_start = base_date + pd.Timedelta(hours=hour)
+    hour_end = hour_start + pd.Timedelta(hours=1)
+    
+    # Filtrujemy oryginalne sesje, które przecinają się z daną godziną
+    df_hour_sessions = df[df['Wydzial'] == hour_intervals['Wydzial'].iloc[0]]
+    df_hour_sessions = df_hour_sessions[(df_hour_sessions['StatusDateTime'] < hour_end) & (df_hour_sessions['EndDateTime'] > hour_start)]
+
+    timeline = []
+    for _, row in df_hour_sessions.iterrows():
+        start = max(row['StatusDateTime'], hour_start)
+        end = min(row['EndDateTime'], hour_end)
+        timeline.append((start, 1))
+        timeline.append((end, -1))
+    timeline.sort()
+
+    active = 0
+    current_time = hour_start
+    time_over_thresholds = {f'over_{t}': 0.0 for t in thresholds}
+    
+    for time, change in timeline:
+        if time > current_time:
+            duration = (time - current_time).total_seconds()
+            for t in thresholds:
+                if active > t:
+                    time_over_thresholds[f'over_{t}'] += duration
+        active += change
+        current_time = time
+    
+    if current_time < hour_end:
+        duration = (hour_end - current_time).total_seconds()
+        for t in thresholds:
+            if active > t:
+                time_over_thresholds[f'over_{t}'] += duration
+                
+    return time_over_thresholds
+
+
+# === UNIWERSALNA FUNKCJA DO TWORZENIA DASHBOARDÓW ===
+def stworz_dashboard(heatmap_data, fig_title, cmap):
+    fig_height = max(10, len(heatmap_data.index) * 1.0)
+    fig = plt.figure(figsize=(18, fig_height))
+    ax_main = plt.subplot2grid((5, 5), (0, 0), rowspan=3, colspan=4)
+    im = ax_main.imshow(heatmap_data.values, cmap=cmap, aspect='auto', interpolation='nearest', vmin=0)
+    ax_main.set_xticks(np.arange(heatmap_data.shape[1]))
+    ax_main.set_xticklabels([f"{h:02d}:00" for h in heatmap_data.columns], rotation=45, ha="right")
+    ax_main.set_yticks(np.arange(len(heatmap_data.index)))
+    ax_main.set_yticklabels(heatmap_data.index)
+    ax_main.set_title("Minuty na statusie koordynatorskim per godzinę", fontsize=12)
+    ax_main.set_ylabel("Koordynator", fontsize=12)
+    for r in range(len(heatmap_data.index)):
+        for c in range(heatmap_data.shape[1]):
+            value = heatmap_data.iloc[r, c]
+            if value > 0:
+                text_color = 'white' if value > np.nanmax(heatmap_data.values) * 0.5 else 'black'
+                ax_main.text(c, r, f'{int(value)}', ha='center', va='center', color=text_color, fontsize=9)
+    ax_right = plt.subplot2grid((5, 5), (0, 4), rowspan=3, colspan=1)
+    sumy_per_row = heatmap_data.sum(axis=1)
+    bar_colors = plt.cm.Set3(np.linspace(0, 1, len(sumy_per_row)))
+    bars = ax_right.barh(sumy_per_row.index, sumy_per_row.values, color=bar_colors, alpha=0.8)
+    ax_right.set_title("Suma minut\nna koordynatora", fontsize=12)
+    ax_right.tick_params(axis='y', length=0, labelsize=9)
+    ax_right.invert_yaxis()
+    for bar in bars:
+        width = bar.get_width()
+        if width > 0:
+            x_pos = width - (ax_right.get_xlim()[1] * 0.02)
+            y_pos = bar.get_y() + bar.get_height() / 2
+            ax_right.text(x_pos, y_pos, f'{int(width)}', va='center', ha='right', color='white', fontsize=9)
+    ax_bottom = plt.subplot2grid((5, 5), (3, 0), rowspan=2, colspan=4)
+    sumy_per_col = heatmap_data.sum(axis=0)
+    ax_bottom.bar(sumy_per_col.index, sumy_per_col.values, color='steelblue', alpha=0.7)
+    ax_bottom.set_title("Suma minut na godzinę (zespoły w wydziale)", fontsize=12)
+    ax_bottom.set_xticks(np.arange(0, 24, 2))
+    ax_bottom.set_xlim(-0.5, 23.5)
+    cbar = plt.colorbar(im, ax=ax_main, shrink=0.8, aspect=20); cbar.set_label("Minuty", fontsize=11)
+    fig.suptitle(fig_title, fontsize=18)
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    img_buffer = io.BytesIO()
+    plt.savefig(img_buffer, format='png', dpi=200, bbox_inches='tight', facecolor='white')
+    img_buffer.seek(0)
+    plt.close(fig)
+    return img_buffer
+
+# === Krok 5: Główna pętla - Generowanie i wysyłka raportów ===
+logging.info("Krok 5: Rozpoczynanie pętli generowania i wysyłki raportów...")
+plt.rcParams['font.family'] = 'sans-serif'
+plt.rcParams['font.sans-serif'] = ['Arial']
+
+# Przygotowanie palet kolorów
+base_cmap_names = ['Blues', 'Greens', 'Reds', 'Oranges', 'Purples', 'Greys']
+color_map_list = []
+for name in base_cmap_names:
+    original_cmap = plt.get_cmap(name)
+    end_color = original_cmap(0.75)
+    new_cmap = LinearSegmentedColormap.from_list(f'custom_{name}', ['#FFFFFF', end_color])
+    color_map_list.append(new_cmap)
+
+report_date = df['StatusDateTime'].min().normalize() if not df.empty else datetime.now().normalize()
+day_names_polish = {'Monday': 'Poniedziałek', 'Tuesday': 'Wtorek', 'Wednesday': 'Środa', 'Thursday': 'Czwartek', 'Friday': 'Piątek', 'Saturday': 'Sobota', 'Sunday': 'Niedziela'}
+english_day = report_date.strftime("%A"); polish_day = day_names_polish.get(english_day, english_day)
+today_str = report_date.strftime(f"%Y-%m-%d {polish_day}")
+
+# Iteracja po każdym unikalnym wydziale
+for i, wydzial in enumerate(df_koordynatorzy['Wydzial'].unique()):
+    logging.info(f"--- Przetwarzanie wydziału: {wydzial} ---")
+    
+    # 1. Pobranie adresatów
+    manager_email = manager_email_map.get(wydzial)
+    if not manager_email:
+        logging.warning(f"Nie znaleziono e-maila menedżera dla wydziału {wydzial}. Pomijanie.")
+        continue
+    
+    coord_emails = df_koordynatorzy[df_koordynatorzy['Wydzial'] == wydzial]['mail'].tolist()
+    
+    # 2. Obliczenia dla spersonalizowanej tabeli
+    thresholds = [3, 4, 5, 6]
+    report_data = []
+    intervals_wydzialu = intervals_df[intervals_df['Wydzial'] == wydzial]
+    for hour in range(24):
+        violations = calculate_time_over_dept_thresholds(intervals_wydzialu, hour, thresholds)
+        row_data = {'Hour': f"{hour:02d}:00"}
+        for t in thresholds:
+            row_data[f'> {t} os.'] = round(violations[f'over_{t}'] / 60)
+        report_data.append(row_data)
+    
+    df_report = pd.DataFrame(report_data)
+
+    # 3. Budowanie treści HTML
+    html_content = f"""
+    <!DOCTYPE html><html><head></head><body style="font-family: Arial, sans-serif;">
+    <p>Dzienny raport naruszeń limitów dla wydziału {wydzial} z dnia {today_str}.</p>
+    <table border="1" cellpadding="3" cellspacing="0" style="border-collapse:collapse;">
+    <tr><th style="background-color:#e0e0e0; padding: 5px;">Interwał</th>
+    """
+    for t in thresholds:
+        html_content += f'<th style="background-color:#e0e0e0; padding: 5px;">min. przy >{t} os.</th>'
+    html_content += "</tr>"
+
+    for idx, row in df_report.iterrows():
+        row_bg_color = "#f2f2f2" if idx % 2 == 0 else "#ffffff"
+        html_content += f'<tr style="background-color:{row_bg_color};">'
+        html_content += f'<td style="text-align:center; padding: 5px;">{row["Hour"]}</td>'
+        for t in thresholds:
+            val = row[f'> {t} os.']
+            cell_bg = '#ffcccc' if val > 0 else ''
+            display_val = f'{val}' if val > 0 else ''
+            html_content += f'<td style="text-align:center; padding: 5px; background-color:{cell_bg}">{display_val}</td>'
+        html_content += "</tr>"
+    html_content += "</table>"
+
+    # 4. Generowanie odpowiedniego dashboardu
+    logging.info(f" -> Generowanie dashboardu dla koordynatorów w {wydzial}...")
+    cmap = color_map_list[i % len(color_map_list)]
+    aktywnosci_w_dziale = intervals_df[intervals_df['Wydzial'] == wydzial]
+    koordynatorzy_grouped = aktywnosci_w_dziale.groupby(['Hour', 'PrzelozonyLoginWindows']).agg({'Seconds': 'sum'}).reset_index()
+    pelna_lista_koordynatorow = df_koordynatorzy[df_koordynatorzy['Wydzial'] == wydzial]['PrzelozonyLoginWindows'].unique()
+    
+    image_buffer = None
+    if len(pelna_lista_koordynatorow) > 0:
+        heatmap_pivot = koordynatorzy_grouped.pivot_table(index='PrzelozonyLoginWindows', columns='Hour', values='Seconds', aggfunc='sum').apply(seconds_to_minutes)
+        heatmap_data_koordynatorzy = heatmap_pivot.reindex(index=pelna_lista_koordynatorow, columns=range(24)).fillna(0)
+        image_buffer = stworz_dashboard(
+            heatmap_data=heatmap_data_koordynatorzy,
+            fig_title=f"Dashboard aktywności statusy koordynatorskie - wydział {wydzial}",
+            main_title='Minuty na statusie koordynatorskim per godzinę',
+            y_axis_label='Koordynator',
+            right_bar_title='Suma minut\nna koordynatora',
+            bottom_bar_title='Suma minut na godzinę (zespoły w wydziale)',
+            cmap=cmap 
+        )
+        html_content += '<table border="0" cellpadding="0" cellspacing="0" width="100%"><tr><td height="25" style="font-size: 25px; line-height: 25px;">&nbsp;</td></tr></table>'
+        html_content += f'<table border="0" cellpadding="0" cellspacing="0" width="800" align="left"><tr><td><img src="cid:image_dept" width="800" style="width: 800px; height: auto; display: block;"></td></tr></table>'
+    
+    html_content += "</body></html>"
+    
+    # 5. Wysyłka e-maila
+    logging.info(f" -> Wysyłanie e-maila do menedżera wydziału {wydzial}...")
+    msg = MIMEMultipart('related')
+    msg['From'] = sender_email
+    msg['To'] = manager_email
+    msg['Cc'] = ", ".join(coord_emails)
+    msg['Bcc'] = so_email
+    msg['Subject'] = Header(f"{subject_template} - {wydzial} - {today_str}", 'utf-8')
+    
+    html_part = MIMEText(html_content, 'html', 'utf-8')
+    msg.attach(html_part)
+    
+    if image_buffer:
+        img = MIMEImage(image_buffer.read())
+        img.add_header('Content-ID', '<image_dept>')
+        img.add_header('Content-Disposition', 'inline', filename='dashboard.png')
+        msg.attach(img)
+    
+    try:
+        with smtplib.SMTP(smtp_server) as server:
+            all_recipients = [manager_email] + coord_emails + [so_email]
+            server.sendmail(sender_email, all_recipients, msg.as_string())
+        logging.info(f"E-mail dla wydziału {wydzial} został pomyślnie wysłany!")
+    except Exception:
+        logging.exception(f"Wystąpił błąd podczas wysyłania e-maila dla wydziału {wydzial}.")
+
+logging.info("--- Zakończono pracę skryptu menedżerskiego ---")
