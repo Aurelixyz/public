@@ -1,0 +1,78 @@
+# WYKRES 3: Dashboard naruszeń limitów wydziałowych (minuty z >3 konsultantami)
+fig = plt.figure(figsize=(18, 12))
+ax_main = plt.subplot2grid((4, 4), (0, 0), colspan=3, rowspan=3)
+dept_heatmap_cols = [f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes' for dept in departments]
+df_heatmap = grouped.set_index('Hour')[dept_heatmap_cols].T
+df_heatmap.columns = [f"{h:02d}:00" for h in grouped['Hour']];
+df_heatmap.index = departments
+colors_blue = ['#f7fbff', '#deebf7', '#c6dbef', '#9ecae1', '#6baed6', '#4292c6', '#2171b5', '#084594']
+cmap_blue = LinearSegmentedColormap.from_list('custom_blue', colors_blue, N=100)
+im = ax_main.imshow(df_heatmap.values, cmap=cmap_blue, aspect='auto', interpolation='nearest')
+ax_main.set_xlim(-0.5, len(df_heatmap.columns) - 0.5);
+ax_main.set_ylim(-0.5, len(df_heatmap.index) - 0.5)
+ax_main.set_xticks(range(0, len(df_heatmap.columns), 2));
+ax_main.set_xticklabels([df_heatmap.columns[i] for i in range(0, len(df_heatmap.columns), 2)], fontsize=11,
+                                     rotation=45)
+ax_main.set_yticks(range(len(df_heatmap.index)));
+ax_main.set_yticklabels(df_heatmap.index, fontsize=12, fontweight='bold')
+for i in range(len(df_heatmap.index)):
+    for j in range(len(df_heatmap.columns)):
+        value = df_heatmap.iloc[i, j]
+        if value > 0:
+            text_color = 'white' if value > df_heatmap.values.max() * 0.6 else 'black'
+            ax_main.text(j, i, f'{int(value)}', ha='center', va='center', fontsize=9, fontweight='bold',
+                                 color=text_color)
+ax_main.set_title(f'Dashboard naruszeń limitów wydziałowych (minuty z >{DEPT_LIMIT} konsultantami)', fontsize=14,
+                                 fontweight='bold', pad=15)
+ax_main.set_ylabel('Wydział', fontsize=12, fontweight='bold')
+
+# Dodanie subtelnej siatki
+ax_main.grid(which='major', color='gray', linestyle=':', linewidth=0.5, alpha=0.5)
+
+ax_right = plt.subplot2grid((4, 4), (0, 3), rowspan=3)
+dept_sums = [grouped[f'{dept}_Over{DEPT_LIMIT}ConsultantsMinutes'].sum() for dept in departments]
+colors_dept = plt.cm.Set3(np.linspace(0, 1, len(departments)))
+bars_right = ax_right.barh(range(len(departments)), dept_sums, color=colors_dept, alpha=0.8)
+ax_right.set_yticks(range(len(departments)));
+ax_right.set_yticklabels(departments, fontsize=10)
+ax_right.set_xlabel('Suma minut', fontsize=11, fontweight='bold');
+ax_right.set_title('Suma minut\nna wydział', fontsize=12, fontweight='bold')
+max_dept_sum = max(dept_sums) if dept_sums else 1
+for i, (bar, value) in enumerate(zip(bars_right, dept_sums)):
+    if value > 0:
+        current_color_rgb = [x * 255 for x in bar.get_facecolor()[:3]]
+        text_color_right = 'black' if sum(current_color_rgb) / 3 > 180 else 'white'
+        if value / max_dept_sum < 0.15:
+            text_x_pos = bar.get_width() + (max_dept_sum * 0.01); ha_align = 'left'; text_color_right = 'black'
+        else:
+            text_x_pos = bar.get_x() + bar.get_width() * 0.25; ha_align = 'left'
+        ax_right.text(text_x_pos, bar.get_y() + bar.get_height() / 2, f'{int(value)}', ha=ha_align, va='center',
+                                 fontsize=10, fontweight='bold', color=text_color_right)
+ax_bottom = plt.subplot2grid((4, 4), (3, 0), colspan=3)
+hour_sums = [grouped[dept_heatmap_cols].iloc[h].sum() for h in range(24)]
+bars_bottom = ax_bottom.bar(range(24), hour_sums, color='steelblue', alpha=0.7)
+ax_bottom.set_xlim(-0.5, 23.5);
+ax_bottom.set_xticks(range(0, 24, 2));
+ax_bottom.set_xticklabels([f"{h:02d}:00" for h in range(0, 24, 2)], fontsize=10)
+ax_bottom.set_xlabel('Godzina', fontsize=11, fontweight='bold');
+ax_bottom.set_ylabel('Suma minut', fontsize=11, fontweight='bold');
+ax_bottom.set_title('Minut na godzinę', fontsize=12, fontweight='bold')
+max_hour_sum = max(hour_sums) if hour_sums else 1
+for i, (bar, value) in enumerate(zip(bars_bottom, hour_sums)):
+    if value > 0:
+        text_color_bottom = 'white' if value / max_hour_sum > 0.3 else 'black'
+        if value / max_hour_sum < 0.1:
+            text_y_pos = bar.get_height() + 5; va_align = 'bottom'; text_color_bottom = 'black'
+        else:
+            text_y_pos = bar.get_height() * 0.7; va_align = 'center'
+        ax_bottom.text(bar.get_x() + bar.get_width() / 2, text_y_pos, f'{int(value)}', ha='center', va=va_align,
+                                 fontsize=9, fontweight='bold', color=text_color_bottom)
+cbar = plt.colorbar(im, ax=ax_main, shrink=0.8, aspect=20);
+cbar.set_label('Minuty', fontsize=11, fontweight='bold')
+plt.tight_layout(pad=2.0)
+img_buffer_3 = io.BytesIO()
+plt.savefig(img_buffer_3, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+img_buffer_3.seek(0)
+image_buffers.append(img_buffer_3)
+plt.close()
+print(f"✅ Wizualizacje zostały wygenerowane w pamięci.")
