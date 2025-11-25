@@ -2,15 +2,16 @@ Option Explicit
 
 ' === USTAWIENIA ===
 Private Const CHART_NAME As String = "Wykresb"
-Private Const ADD_LABELS As Boolean = False ' Etykiety wyłączone, bo używamy tooltipów (dymków)
+Private Const ADD_LABELS As Boolean = False
 Private Const MARKER_SIZE As Integer = 7
 
-' Margines wokół punktów (np. 1 jednostka)
+' Margines wokół punktów (skala)
 Private Const AXIS_PADDING As Double = 1
 
-' Granice "Złej Strefy" (Kwadratu)
-Private Const BOX_LIMIT_X As Double = 80 ' NPS granica
-Private Const BOX_LIMIT_Y As Double = 5  ' EFE granica
+' === USTAWIENIA KWADRATU ===
+Private Const BOX_LIMIT_X As Double = 80  ' Granica NPS
+Private Const BOX_LIMIT_Y As Double = 5   ' Granica EFE
+Private Const BOX_THICKNESS As Double = 2.5 ' Grubość linii (pogrubienie)
 
 Private Function PaletteColors() As Variant
     PaletteColors = Array( _
@@ -55,19 +56,20 @@ Private Sub DeleteChartIfExists(ByVal ws As Worksheet, ByVal chartName As String
     Next co
 End Sub
 
-' === SKALOWANIE I KWADRAT ===
+' === LOGIKA SKALOWANIA I RYSOWANIA RAMKI ===
 Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVal dictY As Object)
     Dim keys As Variant: keys = dictX.keys
     Dim i As Long, arrX As Variant, arrY As Variant
     Dim minX As Double, maxX As Double, minY As Double, maxY As Double
     Dim v As Double
     
-    ' Inicjalizacja szukania min/max w danych
+    ' Inicjalizacja zakresów
     minX = 1E+308: maxX = -1E+308
     minY = 1E+308: maxY = -1E+308
     
     Dim hasData As Boolean: hasData = False
     
+    ' Szukamy skrajnych wartości w danych
     For i = LBound(keys) To UBound(keys)
         arrX = dictX(keys(i))
         arrY = dictY(keys(i))
@@ -91,7 +93,7 @@ Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVa
         minX = 0: maxX = 100: minY = 0: maxY = 10
     End If
     
-    ' Ustalenie granic osi z marginesem
+    ' Obliczamy granice osi z marginesem
     Dim finalMinX As Double, finalMaxX As Double
     Dim finalMinY As Double, finalMaxY As Double
     
@@ -103,7 +105,7 @@ Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVa
     If finalMaxX <= finalMinX Then finalMaxX = finalMinX + 5
     If finalMaxY <= finalMinY Then finalMaxY = finalMinY + 2
 
-    ' Aplikacja osi
+    ' Ustawiamy osie
     With ch
         ' Oś X
         .Axes(xlCategory).MinimumScale = finalMinX
@@ -121,7 +123,9 @@ Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVa
         .Axes(xlValue).HasMajorGridlines = True
     End With
     
-    ' Rysowanie Kwadratu (przycięcie do widoku)
+    ' === AKTUALIZACJA WSPÓŁRZĘDNYCH KWADRATU ===
+    ' Kwadrat ma być od początku osi do 80 (X) i do 5 (Y)
+    
     Dim boxLeft As Double, boxRight As Double
     Dim boxBottom As Double, boxTop As Double
     
@@ -130,10 +134,13 @@ Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVa
     boxBottom = finalMinY
     boxTop = BOX_LIMIT_Y
     
+    ' Jeśli wykres zaczyna się dalej niż granica kwadratu, przytnij go
     If boxRight < boxLeft Then boxRight = boxLeft
     If boxTop < boxBottom Then boxTop = boxBottom
     
     Dim sBox As Series, s As Series, boxFound As Boolean
+    
+    ' Znajdź serię kwadratu po nazwie
     For Each s In ch.SeriesCollection
         If s.Name = "Kwadrat_Graniczny" Then
             Set sBox = s
@@ -143,6 +150,7 @@ Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVa
     Next s
     
     If boxFound Then
+        ' Rysujemy linię ciągłą wokół obszaru
         sBox.XValues = Array(boxLeft, boxRight, boxRight, boxLeft, boxLeft)
         sBox.Values = Array(boxBottom, boxBottom, boxTop, boxTop, boxBottom)
     End If
@@ -169,14 +177,11 @@ Public Sub UtworzWykresKolorWgbu()
     
     Set headerRow = rngData.Rows(1)
     
-    Dim colLabel As Long
-    Dim colGroup As Long
-    Dim colNps As Long
-    Dim colEfe As Long
+    Dim colLabel As Long, colGroup As Long, colNps As Long, colEfe As Long
     
-    ' === ZMIANA TUTAJ: Szukamy "nazwisko_imie" ===
+    ' Szukamy kolumny 'nazwisko_imie'
     colLabel = FindColumn(headerRow, "nazwisko_imie")
-    If colLabel = 0 Then colLabel = FindColumn(headerRow, "nr_a") ' Fallback, gdyby nie było nazwiska
+    If colLabel = 0 Then colLabel = FindColumn(headerRow, "nr_a") ' Fallback
     
     colGroup = FindColumn(headerRow, "b")
     colNps = FindColumn(headerRow, "nps")
@@ -186,7 +191,7 @@ Public Sub UtworzWykresKolorWgbu()
         Err.Raise vbObjectError + 7701, , "Nie znaleziono kolumn (b, nps, efe)."
     End If
     
-    ' 2. Analiza danych
+    ' 2. Analiza danych (Słowniki)
     Dim dictColors As Object: Set dictColors = CreateObject("Scripting.Dictionary")
     Dim dictX_All As Object: Set dictX_All = CreateObject("Scripting.Dictionary")
     Dim dictY_All As Object: Set dictY_All = CreateObject("Scripting.Dictionary")
@@ -208,6 +213,7 @@ Public Sub UtworzWykresKolorWgbu()
         npsVal = ws.Cells(r, colNps).Value
         efeVal = ws.Cells(r, colEfe).Value
         If IsNumeric(npsVal) And IsNumeric(efeVal) Then
+            ' Zbieramy wszystko do "ALL" tylko dla celów obliczenia skali
             If Not dictX_All.Exists("ALL") Then
                 dictX_All.Add "ALL", Empty
                 dictY_All.Add "ALL", Empty
@@ -217,7 +223,7 @@ Public Sub UtworzWykresKolorWgbu()
         End If
     Next r
     
-    ' 3. Tworzenie wykresu
+    ' 3. Tworzenie pustego wykresu
     DeleteChartIfExists ws, CHART_NAME
     
     Dim co As ChartObject
@@ -245,7 +251,7 @@ Public Sub UtworzWykresKolorWgbu()
     Dim k As Variant
     Dim clr As Long
     
-    ' A: Dodajemy Atrapy Legendy (tylko kolory)
+    ' KROK A: Dodajemy atrapy do legendy (Grupy/Kolory)
     For Each k In dictColors.keys
         Set s = co.Chart.SeriesCollection.NewSeries
         s.Name = CStr(k)
@@ -262,7 +268,7 @@ Public Sub UtworzWykresKolorWgbu()
         On Error GoTo 0
     Next k
     
-    ' B: Dodajemy Punkty jako Serie (by nazwisko było w dymku)
+    ' KROK B: Dodajemy punkty jako osobne serie (dla dymków)
     Dim labelTxt As String
     
     For r = rngData.Row + 1 To rngData.Row + rngData.Rows.Count - 1
@@ -273,7 +279,6 @@ Public Sub UtworzWykresKolorWgbu()
             groupKey = Trim$(CStr(ws.Cells(r, colGroup).Value))
             If Len(groupKey) = 0 Then groupKey = "Inne"
             
-            ' Pobieramy nazwisko_imie
             If colLabel > 0 Then
                 labelTxt = CStr(ws.Cells(r, colLabel).Value)
             Else
@@ -281,7 +286,7 @@ Public Sub UtworzWykresKolorWgbu()
             End If
             
             Set s = co.Chart.SeriesCollection.NewSeries
-            ' Nazwa serii = Nazwisko_Imie (to pokaże tooltip)
+            ' Tutaj ustawiamy Nazwisko jako nazwę serii (to widać po najechaniu)
             s.Name = labelTxt
             s.XValues = Array(CDbl(npsVal))
             s.Values = Array(CDbl(efeVal))
@@ -295,30 +300,34 @@ Public Sub UtworzWykresKolorWgbu()
             s.MarkerForegroundColor = clr
             s.Format.Line.Visible = msoFalse
             
-            ' Usuwamy z legendy, by nie było tłoku
+            ' Usuwamy serię z legendy (żeby nie było tłoku)
             co.Chart.Legend.LegendEntries(co.Chart.Legend.LegendEntries.Count).Delete
             On Error GoTo 0
         End If
     Next r
     
-    ' C: Kwadrat
+    ' KROK C: Dodajemy Kwadrat (jako ostatnią serię)
     Dim sBox As Series
     Set sBox = co.Chart.SeriesCollection.NewSeries
     With sBox
         .Name = "Kwadrat_Graniczny"
         .ChartType = xlXYScatterLinesNoMarkers
-        .XValues = Array(0, 1)
+        .XValues = Array(0, 1) ' Placeholdery
         .Values = Array(0, 1)
+        
+        ' Stylizacja: Czerwony, Grubszy, Ciągły
         .Format.Line.ForeColor.RGB = RGB(255, 0, 0)
-        .Format.Line.Weight = 1.5
-        .Format.Line.DashStyle = msoLineDash
+        .Format.Line.Weight = BOX_THICKNESS         ' Pogrubienie
+        .Format.Line.DashStyle = msoLineSolid       ' Linia ciągła
     End With
     
+    ' WAŻNE: Usunięcie kwadratu z legendy
+    ' Ponieważ dodaliśmy go jako ostatniego, usuwamy ostatni wpis
     On Error Resume Next
-    co.Chart.Legend.LegendEntries(co.Chart.SeriesCollection.Count).Delete
+    co.Chart.Legend.LegendEntries(co.Chart.Legend.LegendEntries.Count).Delete
     On Error GoTo 0
     
-    ' Skalowanie
+    ' KROK D: Skalowanie i dorysowanie ramki
     ApplySmartScaleAndBox co.Chart, dictX_All, dictY_All
     
 CleanExit:
