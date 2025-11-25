@@ -1,0 +1,316 @@
+Option Explicit
+
+' === USTAWIENIA ===
+Private Const CHART_NAME As String = "Wykresb"
+Private Const ADD_LABELS As Boolean = False
+Private Const MARKER_SIZE As Integer = 7
+
+' Margines wokół punktów (np. 1 jednostka)
+Private Const AXIS_PADDING As Double = 1
+
+' Granice "Złej Strefy" (Kwadratu)
+Private Const BOX_LIMIT_X As Double = 80 ' NPS granica
+Private Const BOX_LIMIT_Y As Double = 5  ' EFE granica
+
+Private Function PaletteColors() As Variant
+    PaletteColors = Array( _
+        RGB(33, 150, 243), RGB(244, 67, 54), RGB(76, 175, 80), _
+        RGB(255, 193, 7), RGB(156, 39, 176), RGB(0, 188, 212), _
+        RGB(121, 85, 72), RGB(63, 81, 181), RGB(255, 87, 34), _
+        RGB(205, 220, 57), RGB(0, 150, 136), RGB(158, 158, 158) _
+    )
+End Function
+
+Private Function Push(arr As Variant, ByVal val As Variant) As Variant
+    Dim n As Long
+    If IsEmpty(arr) Then
+        ReDim arr(1 To 1)
+        arr(1) = val
+    Else
+        n = UBound(arr) + 1
+        ReDim Preserve arr(1 To n)
+        arr(n) = val
+    End If
+    Push = arr
+End Function
+
+Private Function FindColumn(ByVal headerRow As Range, ByVal headerName As String) As Long
+    Dim c As Range
+    For Each c In headerRow.Cells
+        If Trim$(LCase$(CStr(c.Value))) = Trim$(LCase$(headerName)) Then
+            FindColumn = c.Column
+            Exit Function
+        End If
+    Next c
+    FindColumn = 0
+End Function
+
+Private Sub DeleteChartIfExists(ByVal ws As Worksheet, ByVal chartName As String)
+    Dim co As ChartObject
+    For Each co In ws.ChartObjects
+        If co.Name = chartName Then
+            co.Delete
+            Exit For
+        End If
+    Next co
+End Sub
+
+' === NOWA FUNKCJA: Skala wg Danych + Dopasowanie Kwadratu ===
+Private Sub ApplySmartScaleAndBox(ByVal ch As Chart, ByVal dictX As Object, ByVal dictY As Object)
+    Dim keys As Variant: keys = dictX.keys
+    Dim i As Long, arrX As Variant, arrY As Variant
+    Dim minX As Double, maxX As Double, minY As Double, maxY As Double
+    Dim v As Double
+    
+    ' 1. Inicjalizacja na "nieskończoność" - szukamy tylko w danych
+    minX = 1E+308: maxX = -1E+308
+    minY = 1E+308: maxY = -1E+308
+    
+    Dim hasData As Boolean: hasData = False
+    
+    ' 2. Znalezienie min/max tylko z punktów danych
+    For i = LBound(keys) To UBound(keys)
+        arrX = dictX(keys(i))
+        arrY = dictY(keys(i))
+        If Not IsEmpty(arrX) And Not IsEmpty(arrY) Then
+            Dim p As Long
+            For p = LBound(arrX) To UBound(arrX)
+                v = arrX(p)
+                If v < minX Then minX = v
+                If v > maxX Then maxX = v
+            Next p
+            For p = LBound(arrY) To UBound(arrY)
+                v = arrY(p)
+                If v < minY Then minY = v
+                If v > maxY Then maxY = v
+            Next p
+            hasData = True
+        End If
+    Next i
+    
+    ' Zabezpieczenie na wypadek braku danych
+    If Not hasData Then
+        minX = 0: maxX = 100
+        minY = 0: maxY = 10
+    End If
+    
+    ' 3. Ustalenie granic osi z małym marginesem (np. +/- 1)
+    Dim finalMinX As Double, finalMaxX As Double
+    Dim finalMinY As Double, finalMaxY As Double
+    
+    ' Floor/Ceiling zapewnia liczby całkowite
+    finalMinX = Application.WorksheetFunction.Floor_Math(minX - AXIS_PADDING)
+    finalMaxX = Application.WorksheetFunction.Ceiling_Math(maxX + AXIS_PADDING)
+    finalMinY = Application.WorksheetFunction.Floor_Math(minY - AXIS_PADDING)
+    finalMaxY = Application.WorksheetFunction.Ceiling_Math(maxY + AXIS_PADDING)
+    
+    ' Dodatkowe zabezpieczenie, by max > min (gdy jest 1 punkt)
+    If finalMaxX <= finalMinX Then finalMaxX = finalMinX + 5
+    If finalMaxY <= finalMinY Then finalMaxY = finalMinY + 2
+
+    ' 4. Aplikacja skali do wykresu
+    With ch
+        ' Oś X
+        .Axes(xlCategory).MinimumScale = finalMinX
+        .Axes(xlCategory).MaximumScale = finalMaxX
+        .Axes(xlCategory).MajorUnit = 1           ' Skok co 1
+        .Axes(xlCategory).TickLabels.NumberFormat = "0"
+        
+        ' Oś Y
+        .Axes(xlValue).MinimumScale = finalMinY
+        .Axes(xlValue).MaximumScale = finalMaxY
+        .Axes(xlValue).MajorUnit = 1              ' Skok co 1
+        .Axes(xlValue).TickLabels.NumberFormat = "0"
+        
+        .Axes(xlCategory).HasMajorGridlines = True
+        .Axes(xlValue).HasMajorGridlines = True
+    End With
+    
+    ' 5. Rysowanie Kwadratu (obcinanie do widoku)
+    ' Kwadrat ma być od Początku Osi do 80 (X) i od Początku Osi do 5 (Y)
+    
+    Dim boxLeft As Double, boxRight As Double
+    Dim boxBottom As Double, boxTop As Double
+    
+    ' Lewa krawędź to początek osi (np. 65)
+    boxLeft = finalMinX
+    ' Prawa krawędź to 80. Ale jeśli oś zaczyna się np. od 85, to kwadratu nie widać.
+    boxRight = BOX_LIMIT_X
+    
+    ' Dół to początek osi (np. 2)
+    boxBottom = finalMinY
+    ' Góra to 5
+    boxTop = BOX_LIMIT_Y
+    
+    ' Logika: jeśli granica kwadratu (80) jest mniejsza niż start osi, spłaszczamy go (ukrywamy)
+    If boxRight < boxLeft Then boxRight = boxLeft
+    If boxTop < boxBottom Then boxTop = boxBottom
+    
+    ' Znajdź serię i zaktualizuj współrzędne
+    Dim sBox As Series, s As Series
+    Dim boxFound As Boolean
+    
+    For Each s In ch.SeriesCollection
+        If s.Name = "Kwadrat_Graniczny" Then
+            Set sBox = s
+            boxFound = True
+            Exit For
+        End If
+    Next s
+    
+    If boxFound Then
+        ' Rysujemy prostokąt liniami: (L, B) -> (R, B) -> (R, T) -> (L, T) -> (L, B)
+        sBox.XValues = Array(boxLeft, boxRight, boxRight, boxLeft, boxLeft)
+        sBox.Values = Array(boxBottom, boxBottom, boxTop, boxTop, boxBottom)
+    End If
+    
+End Sub
+
+Public Sub UtworzWykresKolorWgbu()
+    Dim ws As Worksheet: Set ws = ActiveSheet
+    Dim rngData As Range
+    Dim headerRow As Range
+    Dim lastRow As Long, lastCol As Long
+    
+    Application.ScreenUpdating = False
+    Application.EnableEvents = False
+    
+    On Error GoTo CleanFail
+    
+    ' Pobranie zakresu danych
+    With ws
+        lastRow = .Cells(.Rows.Count, 1).End(xlUp).Row
+        lastCol = .Cells(1, .Columns.Count).End(xlToLeft).Column
+        If lastRow < 2 Then Err.Raise vbObjectError + 7702, , "Brak danych."
+        Set rngData = .Range(.Cells(1, 1), .Cells(lastRow, lastCol)).CurrentRegion
+    End With
+    
+    Set headerRow = rngData.Rows(1)
+    
+    ' Szukanie kolumn
+    Dim colNrKad As Long, colWydz As Long, colNps As Long, colEfe As Long
+    colNrKad = FindColumn(headerRow, "nr_a")
+    colWydz = FindColumn(headerRow, "b")
+    colNps = FindColumn(headerRow, "nps")
+    colEfe = FindColumn(headerRow, "efe")
+    
+    If colNrKad * colWydz * colNps * colEfe = 0 Then
+        Err.Raise vbObjectError + 7701, , "Nie znaleziono kolumn: 'nr_a', 'b', 'nps', 'efe'."
+    End If
+    
+    ' Słowniki na dane
+    Dim dictX As Object, dictY As Object, dictLbl As Object
+    Set dictX = CreateObject("Scripting.Dictionary")
+    Set dictY = CreateObject("Scripting.Dictionary")
+    Set dictLbl = CreateObject("Scripting.Dictionary")
+    
+    Dim r As Long, npsVal As Variant, efeVal As Variant, wydzKey As String, nrk As String
+    
+    For r = rngData.Row + 1 To rngData.Row + rngData.Rows.Count - 1
+        nrk = CStr(ws.Cells(r, colNrKad).Value)
+        wydzKey = Trim$(CStr(ws.Cells(r, colWydz).Value))
+        If Len(wydzKey) = 0 Then wydzKey = "Brak c"
+        
+        npsVal = ws.Cells(r, colNps).Value
+        efeVal = ws.Cells(r, colEfe).Value
+        
+        If IsNumeric(npsVal) And IsNumeric(efeVal) Then
+            If Not dictX.Exists(wydzKey) Then
+                dictX.Add wydzKey, Empty
+                dictY.Add wydzKey, Empty
+                dictLbl.Add wydzKey, Empty
+            End If
+            dictX(wydzKey) = Push(dictX(wydzKey), CDbl(npsVal))
+            dictY(wydzKey) = Push(dictY(wydzKey), CDbl(efeVal))
+            dictLbl(wydzKey) = Push(dictLbl(wydzKey), nrk)
+        End If
+    Next r
+    
+    DeleteChartIfExists ws, CHART_NAME
+    
+    ' Tworzenie wykresu
+    Dim co As ChartObject
+    Set co = ws.ChartObjects.Add( _
+        Left:=ws.Range("I4").Left, _
+        Top:=ws.Range("I4").Top, _
+        Width:=850, Height:=550)
+    co.Name = CHART_NAME
+    
+    With co.Chart
+        .ChartType = xlXYScatter
+        .HasLegend = True
+        .HasTitle = True
+        .ChartTitle.Text = "NPS vs EFE"
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.Text = "NPS"
+        .Axes(xlValue).HasTitle = True
+        .Axes(xlValue).AxisTitle.Text = "EFE"
+        .PlotArea.Format.Fill.Visible = msoFalse
+        .ChartArea.Format.Line.Visible = msoFalse
+        .Legend.Position = xlLegendPositionBottom
+    End With
+    
+    Dim keys As Variant: keys = dictX.keys
+    Dim pal As Variant: pal = PaletteColors()
+    Dim i As Long, clr As Long
+    Dim s As Series
+    Dim lblArr As Variant
+    
+    ' Dodawanie serii danych
+    If UBound(keys) >= 0 Then
+        For i = LBound(keys) To UBound(keys)
+            Set s = co.Chart.SeriesCollection.NewSeries
+            s.Name = CStr(keys(i))
+            s.XValues = dictX(keys(i))
+            s.Values = dictY(keys(i))
+            
+            clr = pal((i - LBound(keys)) Mod (UBound(pal) - LBound(pal) + 1))
+            On Error Resume Next
+            s.MarkerStyle = xlMarkerStyleCircle
+            s.MarkerSize = MARKER_SIZE
+            s.MarkerBackgroundColor = clr
+            s.MarkerForegroundColor = clr
+            s.Format.Line.Visible = msoFalse
+            On Error GoTo 0
+            
+            If ADD_LABELS Then
+                s.ApplyDataLabels xlDataLabelsShowLabel
+                lblArr = dictLbl(keys(i))
+                Dim p As Long
+                For p = 1 To UBound(lblArr)
+                    s.Points(p).DataLabel.Text = CStr(lblArr(p))
+                    s.Points(p).DataLabel.Format.TextFrame2.TextRange.Font.Size = 8
+                Next p
+            End If
+        Next i
+    End If
+    
+    ' Dodanie PUSTEJ serii kwadratu (placeholdery)
+    Dim sBox As Series
+    Set sBox = co.Chart.SeriesCollection.NewSeries
+    With sBox
+        .Name = "Kwadrat_Graniczny"
+        .ChartType = xlXYScatterLinesNoMarkers
+        .XValues = Array(0, 1)
+        .Values = Array(0, 1)
+        .Format.Line.ForeColor.RGB = RGB(255, 0, 0)
+        .Format.Line.Weight = 1.5
+        .Format.Line.DashStyle = msoLineDash
+    End With
+    
+    ' Usuń wpis kwadratu z legendy
+    On Error Resume Next
+    co.Chart.Legend.LegendEntries(co.Chart.SeriesCollection.Count).Delete
+    On Error GoTo 0
+    
+    ' Aplikuj inteligentne skalowanie i dopasuj kwadrat
+    ApplySmartScaleAndBox co.Chart, dictX, dictY
+    
+CleanExit:
+    Application.ScreenUpdating = True
+    Application.EnableEvents = True
+    Exit Sub
+CleanFail:
+    MsgBox "Błąd: " & Err.Description, vbExclamation, "Makro Wykres"
+    Resume CleanExit
+End Sub
